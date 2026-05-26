@@ -1,6 +1,18 @@
 import pytest
 import numpy as np
 from collections import deque
+import os
+from backend.services.database import db
+
+# Use native Linux path to prevent WSL2 drvfs file locking and disk I/O errors
+db.db_path = "/tmp/test_strategy.db"
+if os.path.exists(db.db_path):
+    try:
+        os.remove(db.db_path)
+    except Exception:
+        pass
+db._initialize_db()
+
 from backend.services.strategy_engine import StrategyEngine
 from backend.services.risk_manager import RiskManager
 
@@ -102,3 +114,38 @@ def test_funding_rate_arbitrage_agent():
     assert opportunities[0]["coin"] == "BTC"
     assert opportunities[0]["annualized_apy"] > 0
 
+def test_momentum_signals_with_rolling_buffer():
+    """Verify momentum SMA crossover signals with real rolling price history."""
+    engine = StrategyEngine(asset_a="BTC", asset_b="ETH", window_size=10)
+    # Simulate 25 ticks of rising prices to get SMA fast > SMA slow
+    for i in range(25):
+        engine.price_buffers.setdefault("BTC", deque(maxlen=50))
+        engine.price_buffers["BTC"].append(67000.0 + i * 10.0)
+    signal = engine.calculate_momentum_signals("BTC")
+    assert signal == "LONG"  # Fast SMA > Slow SMA in uptrend
+
+def test_volatility_breakout_with_rolling_buffer():
+    """Verify Bollinger Band breakout detection with real price data."""
+    np.random.seed(123)
+    engine = StrategyEngine(asset_a="BTC", asset_b="ETH", window_size=10)
+    # Fill 25 ticks of stable prices centered around mock mid price (67250)
+    for i in range(25):
+        engine.price_buffers.setdefault("BTC", deque(maxlen=50))
+        engine.price_buffers["BTC"].append(67250.0 + np.random.normal(0, 1.0))
+    signal = engine.calculate_volatility_breakout("BTC")
+    assert signal == "FLAT"  # No breakout on stable prices
+
+def test_grid_trading_levels():
+    """Verify grid trading generates correct number of buy/sell levels."""
+    engine = StrategyEngine(asset_a="BTC", asset_b="ETH", window_size=10)
+    grids = engine.calculate_grid_signals("BTC")
+    assert len(grids["buy_levels"]) == 5
+    assert len(grids["sell_levels"]) == 5
+    assert grids["buy_levels"][0]["price"] < grids["sell_levels"][0]["price"]
+
+def test_market_making_signals():
+    """Verify market making bid/ask spread calculations with imbalance adjustments."""
+    engine = StrategyEngine(asset_a="BTC", asset_b="ETH", window_size=10)
+    mm = engine.calculate_market_making_signals("BTC")
+    assert mm["bid_price"] < mm["ask_price"]
+    assert mm["adverse_selection_halt"] is False  # Default mock imbalance is 0.0

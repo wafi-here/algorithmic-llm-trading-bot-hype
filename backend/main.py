@@ -17,6 +17,7 @@ from backend.services.alerts import alert_broker
 from backend.services.backtester import backtester
 from backend.services.funding_arbitrage import funding_arb_agent
 from backend.services.pairs_scanner import scanner
+from backend.services.execution_algos import execution_algos
 
 # State holder to check bot execution status
 BOT_STATUS = {
@@ -308,10 +309,11 @@ def toggle_funding_arbitrage(request: FundingToggleRequest):
 @app.post("/api/backtest")
 def run_historical_backtest(request: BacktestRequest):
     """Executes a pairs trading simulation run over simulated cointegrated price trails."""
+    df_data = backtester.generate_mock_history(days=5, ticks_per_day=288)
     results = backtester.run_backtest(
-        window_size=request.window_size,
-        entry_threshold=request.entry_threshold,
-        exit_threshold=request.exit_threshold
+        df_data,
+        entry_z=request.entry_threshold,
+        exit_z=request.exit_threshold
     )
     return results
 
@@ -330,7 +332,77 @@ async def configure_telegram_alerts(request: TelegramConfig):
     
     return {"status": "success" if success else "error", "message": "Configuration updated successfully"}
 
+class TwapRequest(BaseModel):
+    coin: str
+    is_buy: bool
+    total_size: float
+    duration_seconds: int = 30
+    slices: int = 3
+
+class VwapRequest(BaseModel):
+    coin: str
+    is_buy: bool
+    total_size: float
+    duration_seconds: int = 30
+    slices: int = 3
+
+class IcebergRequest(BaseModel):
+    coin: str
+    is_buy: bool
+    total_size: float
+    visible_size: float
+
+@app.post("/api/execution/twap")
+async def trigger_twap_execution(request: TwapRequest):
+    """Asynchronously triggers the TWAP slicing algorithm."""
+    asyncio.create_task(execution_algos.execute_twap(
+        coin=request.coin,
+        is_buy=request.is_buy,
+        total_size=request.total_size,
+        duration_seconds=request.duration_seconds,
+        slices=request.slices
+    ))
+    return {"status": "success", "message": "TWAP order thread dispatched."}
+
+@app.post("/api/execution/vwap")
+async def trigger_vwap_execution(request: VwapRequest):
+    """Asynchronously triggers the VWAP weighted slicing algorithm."""
+    asyncio.create_task(execution_algos.execute_vwap(
+        coin=request.coin,
+        is_buy=request.is_buy,
+        total_size=request.total_size,
+        duration_seconds=request.duration_seconds,
+        slices=request.slices
+    ))
+    return {"status": "success", "message": "VWAP order thread dispatched."}
+
+@app.post("/api/execution/iceberg")
+async def trigger_iceberg_execution(request: IcebergRequest):
+    """Asynchronously triggers the Iceberg fractional slice algorithm."""
+    asyncio.create_task(execution_algos.execute_iceberg(
+        coin=request.coin,
+        is_buy=request.is_buy,
+        total_size=request.total_size,
+        visible_size=request.visible_size
+    ))
+    return {"status": "success", "message": "Iceberg order thread dispatched."}
+
+@app.get("/api/strategies/evaluate-all")
+def get_strategy_diagnostics(coin: str = "BTC"):
+    """Evaluates all advanced strategy metrics (Momentum, Breakout, Grid, MM) for diagnostic monitoring."""
+    momentum = strategy_engine.calculate_momentum_signals(coin)
+    breakout = strategy_engine.calculate_volatility_breakout(coin)
+    grid = strategy_engine.calculate_grid_signals(coin)
+    market_making = strategy_engine.calculate_market_making_signals(coin)
+    
+    return {
+        "coin": coin,
+        "momentum_trend": momentum,
+        "bollinger_breakout": breakout,
+        "active_grid_levels": grid,
+        "market_making_skew": market_making
+    }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("backend.main:app", host="0.0.0.0", port=Config.PORT, reload=False)
-

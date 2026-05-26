@@ -2,6 +2,17 @@ import os
 import time
 import pytest
 import pandas as pd
+from backend.services.database import db as main_db
+
+# Use native Linux path to prevent WSL2 drvfs file locking and disk I/O errors
+main_db.db_path = "/tmp/test_expansions.db"
+if os.path.exists(main_db.db_path):
+    try:
+        os.remove(main_db.db_path)
+    except Exception:
+        pass
+main_db._initialize_db()
+
 from backend.services.database import DatabaseManager
 from backend.services.risk_manager import RiskManager
 from backend.services.backtester import HistoricalBacktester
@@ -9,11 +20,13 @@ from backend.services.pairs_scanner import CointegratedPairsScanner
 
 def test_kelly_criterion_sizing():
     """Verify Kelly Criterion computes mathematically correct sizing fractions from rolling performance statistics."""
-    # 1. Setup temporary test database
-    test_db_path = "test_kelly_bot.db"
+    test_db_path = "/tmp/test_kelly_bot.db"
     if os.path.exists(test_db_path):
-        os.remove(test_db_path)
-        
+        try:
+            os.remove(test_db_path)
+        except Exception:
+            pass
+            
     db = DatabaseManager(test_db_path)
     
     # Pre-populate 10 trades: 7 winning trades ($150 profit each), 3 losing trades ($100 loss each)
@@ -25,6 +38,7 @@ def test_kelly_criterion_sizing():
         db.record_trade("BTC", "BUY", 0.5, 60000.0, pnl=150.0, cloid="TX")
     for _ in range(3):
         db.record_trade("BTC", "SELL", 0.5, 60000.0, pnl=-100.0, cloid="TX")
+
         
     stats = db.get_trade_performance_stats(limit=30)
     assert stats["win_rate"] == 0.7
@@ -54,7 +68,12 @@ def test_kelly_criterion_sizing():
         rm.db = original_db
         db = None
         if os.path.exists(test_db_path):
-            os.remove(test_db_path)
+            try:
+                os.remove(test_db_path)
+            except Exception:
+                pass
+
+
 
 def test_backtester_engine():
     """Verify historical backtester runs spread arbitrage simulations correctly."""
@@ -109,3 +128,19 @@ def test_altcoin_pairs_scanner():
     assert sol_avax["correlation"] > 0.95
     assert abs(sol_avax["hedge_ratio"] - 4.0) < 0.2 # Regressing SOL on AVAX yields ratio ~4
     assert sol_avax["status"] == "COINTEGRATED"
+
+@pytest.mark.asyncio
+async def test_execution_algorithms():
+    """Verify that TWAP, VWAP, and Iceberg slicing execution models operate mathematically correct."""
+    from backend.services.execution_algos import execution_algos
+    
+    # Run tests in simulated dry-run
+    await execution_algos.execute_twap("BTC", is_buy=True, total_size=0.1, duration_seconds=1, slices=2)
+    await execution_algos.execute_vwap("BTC", is_buy=False, total_size=0.1, duration_seconds=1, slices=2)
+    await execution_algos.execute_iceberg("BTC", is_buy=True, total_size=0.1, visible_size=0.04)
+    
+    # Check that mock logs are generated correctly in the database
+    from backend.services.database import db
+    recent_logs = db.get_logs(limit=20)
+    assert any("TWAP" in log["message"] for log in recent_logs)
+

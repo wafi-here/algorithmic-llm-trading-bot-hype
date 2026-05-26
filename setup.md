@@ -30,6 +30,14 @@ The system operates as a containerized dual-service deployment:
                   └────────────────────────────────────────┘
 ```
 
+### 1. Dashboard Expansion
+The frontend Glassmorphic Render Desk has been expanded with new advanced panels:
+- **Altcoin Pairs Scanner**: Real-time statistical tracking of correlation, hedge ratio, and cointegration status for multiple asset pairs.
+- **Funding Arbitrage Spreads**: Visual card tracking 8h funding rates and annualized APY opportunities to extract risk-free yield.
+- **Historical Backtest Simulator**: Form controls to test Z-score parameters against simulated price histories before live deployment.
+- **Execution Algorithms**: Execution panels for Time-Weighted Average Price (TWAP), Volume-Weighted Average Price (VWAP), and Iceberg orders for advanced liquidity extraction.
+- **Strategy Diagnostics**: Live monitoring of Momentum Trends, Bollinger Breakouts, Grid Trading levels, and Market Making bid/ask spreads.
+
 ---
 
 ## 🔒 Security Protocol: Agent Wallet Delegation
@@ -49,10 +57,11 @@ To ensure absolute security of your funds, we enforce Hyperliquid's **Agent Wall
 
 ## 🐳 WSL2 & Docker Container Orchestration
 
-Both backend and frontend services are completely containerized. The `docker-compose.yml` mounts a local persistent volume for SQLite history:
+Both backend and frontend services are completely containerized. The `docker-compose.yml` mounts a local persistent volume for SQLite history.
 
 ### 1. File Volume Layout
 - **`trading_bot.db`**: Local SQLite database storing Z-score logs, scraped news sentiment values, executed trades, and backend system logs. Wiped containers do *not* lose this data as it resides in the Docker persistent volume storage.
+- **Note on Connections**: The backend utilizes thread-local `threading.local()` connection pooling to prevent SQLite lock collisions during high-concurrency event loops.
 
 ### 2. Networking Topology
 - **`backend`**: Runs on port `8000`. Exposes FastAPI swagger docs, REST statistics endpoints, and log buffers.

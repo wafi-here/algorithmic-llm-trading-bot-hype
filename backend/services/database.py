@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 import os
 import json
 from datetime import datetime
@@ -7,12 +8,26 @@ from backend.config import Config
 class DatabaseManager:
     def __init__(self, db_path="trading_bot.db"):
         self.db_path = db_path
+        self._local = threading.local()
         self._initialize_db()
 
     def _get_connection(self):
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
+        conn = getattr(self._local, 'conn', None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
         return conn
+
+    def close(self):
+        """Clean up the thread-local database connection."""
+        conn = getattr(self._local, 'conn', None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._local.conn = None
 
     def _initialize_db(self):
         with self._get_connection() as conn:

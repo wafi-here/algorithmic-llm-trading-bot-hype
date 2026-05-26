@@ -82,8 +82,11 @@ class CointegratedPairsScanner:
                     correlation = 0.0
                     
                 # 2. Linear Regression for Hedge Ratio: PriceA = hedge_ratio * PriceB + intercept
-                # We use numpy polyfit (degree 1)
-                slope, intercept = np.polyfit(prices_b, prices_a, 1)
+                # We use numpy polyfit (degree 1) with zero-variance protection
+                if np.std(prices_b) == 0.0 or np.std(prices_a) == 0.0:
+                    slope, intercept = 1.0, 0.0
+                else:
+                    slope, intercept = np.polyfit(prices_b, prices_a, 1)
                 
                 # 3. Residuals Standard Deviation (Spread Stability Index)
                 residuals = prices_a - (slope * prices_b + intercept)

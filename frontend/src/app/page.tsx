@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { 
   Shield, 
   Activity, 
@@ -13,7 +13,12 @@ import {
   ArrowUpRight, 
   ArrowDownRight, 
   Zap, 
-  Power
+  Power,
+  GitCompareArrows,
+  Percent,
+  FlaskConical,
+  Layers,
+  Gauge
 } from "lucide-react";
 
 export default function Home() {
@@ -22,6 +27,18 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(false);
   const [backendUrl, setBackendUrl] = useState("http://localhost:8000");
+  const [pairsData, setPairsData] = useState<any[]>([]);
+  const [fundingData, setFundingData] = useState<any>(null);
+  const [backtestResult, setBacktestResult] = useState<any>(null);
+  const [backtestLoading, setBacktestLoading] = useState(false);
+  const [execStatus, setExecStatus] = useState<string>('');
+  const [stratDiag, setStratDiag] = useState<any>(null);
+  const [btEntryZ, setBtEntryZ] = useState('2.0');
+  const [btExitZ, setBtExitZ] = useState('0.5');
+  const [btWindow, setBtWindow] = useState('30');
+  const [twapForm, setTwapForm] = useState({ coin: 'BTC', side: 'BUY', size: '', duration: '', slices: '' });
+  const [vwapForm, setVwapForm] = useState({ coin: 'BTC', side: 'BUY', size: '', duration: '', slices: '' });
+  const [icebergForm, setIcebergForm] = useState({ coin: 'BTC', side: 'BUY', totalSize: '', visibleSize: '' });
 
   // Fetch metrics and logs
   const fetchData = async () => {
@@ -37,6 +54,17 @@ export default function Home() {
         const logsData = await resLogs.json();
         setLogs(logsData);
       }
+
+      const resPairs = await fetch(`${backendUrl}/api/scanner/pairs`);
+      if (resPairs.ok) {
+        const pd = await resPairs.json();
+        setPairsData(Array.isArray(pd) ? pd.sort((a: any, b: any) => Math.abs(b.correlation ?? 0) - Math.abs(a.correlation ?? 0)) : []);
+      }
+
+      const resFunding = await fetch(`${backendUrl}/api/funding-arbitrage`);
+      if (resFunding.ok) {
+        setFundingData(await resFunding.json());
+      }
       
       setLoading(false);
     } catch (err) {
@@ -49,6 +77,20 @@ export default function Home() {
     const interval = setInterval(fetchData, 2000); // Poll every 2 seconds
     return () => clearInterval(interval);
   }, [backendUrl]);
+
+  // Strategy diagnostics on a 5-second interval
+  const fetchStratDiag = useCallback(async () => {
+    try {
+      const res = await fetch(`${backendUrl}/api/strategies/evaluate-all?coin=BTC`);
+      if (res.ok) setStratDiag(await res.json());
+    } catch (_) {}
+  }, [backendUrl]);
+
+  useEffect(() => {
+    fetchStratDiag();
+    const diagInterval = setInterval(fetchStratDiag, 5000);
+    return () => clearInterval(diagInterval);
+  }, [fetchStratDiag]);
 
   // Handle emergency kill switch or restart
   const handleControl = async (action: "HALT" | "RESET") => {
@@ -83,6 +125,43 @@ export default function Home() {
     } finally {
       setActionLoading(false);
     }
+  };
+
+  // Backtest handler
+  const handleBacktest = async () => {
+    setBacktestLoading(true);
+    setBacktestResult(null);
+    try {
+      const res = await fetch(`${backendUrl}/api/backtest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entry_z: parseFloat(btEntryZ), exit_z: parseFloat(btExitZ), window: parseInt(btWindow) })
+      });
+      if (res.ok) setBacktestResult(await res.json());
+    } catch (_) { setBacktestResult({ error: 'Backtest request failed' }); }
+    finally { setBacktestLoading(false); }
+  };
+
+  // Execution algo handler
+  const handleExec = async (endpoint: string, payload: any) => {
+    setExecStatus('Submitting...');
+    try {
+      const res = await fetch(`${backendUrl}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const result = await res.json();
+      setExecStatus(result?.message || result?.status || 'Order submitted');
+    } catch (_) { setExecStatus('Execution request failed'); }
+  };
+
+  // Funding toggle
+  const handleFundingToggle = async () => {
+    try {
+      await fetch(`${backendUrl}/api/funding-arbitrage/toggle`, { method: 'POST' });
+      fetchData();
+    } catch (_) {}
   };
 
   const getSentimentText = (score: number) => {
@@ -426,6 +505,322 @@ export default function Home() {
               )}
             </div>
           </div>
+
+          {/* ============================================================ */}
+          {/* NEW PANEL 1: Altcoin Pairs Scanner Rankings */}
+          {/* ============================================================ */}
+          <div className="glass-panel rounded-xl p-5">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-xs font-semibold tracking-wider text-slate-400 uppercase flex items-center gap-1.5">
+                <GitCompareArrows className="h-3.5 w-3.5 text-cyan-400" />
+                Altcoin Pairs Scanner Rankings
+              </h3>
+              <span className="text-xs text-zinc-500 font-mono">{pairsData.length} Pairs Tracked</span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left font-mono text-xs">
+                <thead>
+                  <tr className="border-b border-white/5 text-zinc-500">
+                    <th className="pb-2">PAIR</th>
+                    <th className="pb-2">CORRELATION</th>
+                    <th className="pb-2">HEDGE RATIO</th>
+                    <th className="pb-2">STABILITY INDEX</th>
+                    <th className="pb-2 text-right">STATUS</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/5">
+                  {loading ? (
+                    <tr><td colSpan={5} className="py-4 text-center text-zinc-500">Scanning cointegration matrices...</td></tr>
+                  ) : pairsData.length === 0 ? (
+                    <tr><td colSpan={5} className="py-4 text-center text-zinc-500">No pairs data available. Scanner inactive.</td></tr>
+                  ) : (
+                    pairsData.map((pair: any, idx: number) => (
+                      <tr key={idx} className="hover:bg-white/5">
+                        <td className="py-3 font-bold text-white">{pair.pair || `${pair.coin_a}/${pair.coin_b}`}</td>
+                        <td className="py-3 text-cyan-300">{(pair.correlation ?? 0).toFixed(4)}</td>
+                        <td className="py-3 text-slate-200">{(pair.hedge_ratio ?? 0).toFixed(4)}</td>
+                        <td className="py-3 text-slate-200">{(pair.stability_index ?? pair.stability ?? 0).toFixed(4)}</td>
+                        <td className="py-3 text-right">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            (pair.status || '').toUpperCase() === 'COINTEGRATED'
+                              ? 'bg-emerald-950 text-emerald-400 border border-emerald-800/30'
+                              : 'bg-zinc-800 text-zinc-400 border border-zinc-700/30'
+                          }`}>
+                            {(pair.status || 'UNCORRELATED').toUpperCase()}
+                          </span>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* ============================================================ */}
+          {/* NEW PANEL 2: Funding Arbitrage APY Spreads */}
+          {/* ============================================================ */}
+          <div className="glass-panel rounded-xl p-5">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-xs font-semibold tracking-wider text-slate-400 uppercase flex items-center gap-1.5">
+                <Percent className="h-3.5 w-3.5 text-cyan-400" />
+                Funding Arbitrage APY Spreads
+              </h3>
+              <button
+                onClick={handleFundingToggle}
+                className="bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 text-xs font-bold px-4 py-2 rounded-lg transition"
+              >
+                {fundingData?.enabled ? 'Disable' : 'Enable'} Arbitrage
+              </button>
+            </div>
+            {!fundingData || !fundingData.opportunities || fundingData.opportunities.length === 0 ? (
+              <p className="text-zinc-500 text-xs">No funding arbitrage opportunities detected. Scanning perpetual markets...</p>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {fundingData.opportunities.map((opp: any, idx: number) => (
+                  <div key={idx} className="glass-panel rounded-lg p-4 border border-white/5">
+                    <div className="flex justify-between items-start mb-2">
+                      <span className="text-sm font-bold text-white font-mono">{opp.coin || opp.symbol}</span>
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                        (opp.status || 'active').toUpperCase() === 'ACTIVE'
+                          ? 'bg-emerald-950 text-emerald-400 border border-emerald-800/30'
+                          : 'bg-zinc-800 text-zinc-400 border border-zinc-700/30'
+                      }`}>
+                        {(opp.status || 'ACTIVE').toUpperCase()}
+                      </span>
+                    </div>
+                    <div className="text-xs text-zinc-500 mb-1">8h Funding Rate</div>
+                    <div className="text-sm font-mono font-semibold text-slate-200 mb-2">
+                      {(opp.funding_rate_8h ?? opp.funding_rate ?? 0).toFixed(6)}%
+                    </div>
+                    <div className="text-xs text-zinc-500 mb-1">Annualized APY</div>
+                    <div className="text-lg font-extrabold font-mono bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent">
+                      {(opp.annualized_apy ?? opp.apy ?? 0).toFixed(2)}%
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* ============================================================ */}
+          {/* NEW PANEL 3: Historical Backtest Simulator */}
+          {/* ============================================================ */}
+          <div className="glass-panel rounded-xl p-5">
+            <h3 className="text-xs font-semibold tracking-wider text-slate-400 mb-4 uppercase flex items-center gap-1.5">
+              <FlaskConical className="h-3.5 w-3.5 text-cyan-400" />
+              Historical Backtest Simulator
+            </h3>
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4">
+              <div>
+                <label className="text-[10px] text-zinc-500 block mb-1">Entry Z-Score Threshold</label>
+                <input
+                  type="number" step="0.1" value={btEntryZ} onChange={e => setBtEntryZ(e.target.value)}
+                  className="w-full bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-zinc-500 block mb-1">Exit Z-Score Threshold</label>
+                <input
+                  type="number" step="0.1" value={btExitZ} onChange={e => setBtExitZ(e.target.value)}
+                  className="w-full bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-zinc-500 block mb-1">Window Size</label>
+                <input
+                  type="number" step="1" value={btWindow} onChange={e => setBtWindow(e.target.value)}
+                  className="w-full bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50"
+                />
+              </div>
+              <div className="flex items-end">
+                <button
+                  onClick={handleBacktest}
+                  disabled={backtestLoading}
+                  className="w-full bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 text-xs font-bold px-4 py-2 rounded-lg transition disabled:opacity-50"
+                >
+                  {backtestLoading ? 'Simulating...' : 'Run Backtest Simulation'}
+                </button>
+              </div>
+            </div>
+            {backtestResult && !backtestResult.error ? (
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+                {[
+                  { label: 'Total Trades', value: backtestResult.total_trades ?? '—' },
+                  { label: 'Win Rate %', value: backtestResult.win_rate != null ? `${backtestResult.win_rate.toFixed(1)}%` : '—' },
+                  { label: 'Sharpe Ratio', value: backtestResult.sharpe_ratio != null ? backtestResult.sharpe_ratio.toFixed(3) : '—' },
+                  { label: 'Max Drawdown %', value: backtestResult.max_drawdown != null ? `${backtestResult.max_drawdown.toFixed(2)}%` : '—' },
+                  { label: 'Final Balance', value: backtestResult.final_balance != null ? `$${parseFloat(backtestResult.final_balance).toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '—' },
+                  { label: 'Total PnL', value: backtestResult.total_pnl != null ? backtestResult.total_pnl : '—', isPnl: true },
+                ].map((m, i) => (
+                  <div key={i} className="glass-panel rounded-lg p-3 text-center border border-white/5">
+                    <div className="text-[10px] text-zinc-500 mb-1">{m.label}</div>
+                    <div className={`text-sm font-extrabold font-mono ${
+                      m.isPnl ? (parseFloat(String(m.value)) >= 0 ? 'text-emerald-400' : 'text-rose-400') : 'text-white'
+                    }`}>
+                      {m.isPnl && parseFloat(String(m.value)) > 0 ? '+' : ''}
+                      {m.isPnl && m.value !== '—' ? `$${parseFloat(String(m.value)).toLocaleString(undefined, { minimumFractionDigits: 2 })}` : m.value}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : backtestResult?.error ? (
+              <p className="text-rose-400 text-xs font-mono">{backtestResult.error}</p>
+            ) : (
+              <p className="text-zinc-500 text-xs">Configure parameters and run a backtest to view results.</p>
+            )}
+          </div>
+
+          {/* ============================================================ */}
+          {/* NEW PANEL 4: Execution Algorithms Trigger Panel */}
+          {/* ============================================================ */}
+          <div className="glass-panel rounded-xl p-5">
+            <h3 className="text-xs font-semibold tracking-wider text-slate-400 mb-4 uppercase flex items-center gap-1.5">
+              <Layers className="h-3.5 w-3.5 text-cyan-400" />
+              Execution Algorithms Trigger Panel
+            </h3>
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
+              {/* TWAP */}
+              <div className="glass-panel rounded-lg p-4 border border-white/5">
+                <h4 className="text-[11px] font-bold text-cyan-400 mb-3 tracking-wider">TWAP — Time-Weighted</h4>
+                <div className="flex flex-col gap-2">
+                  <input placeholder="Coin (e.g. BTC)" value={twapForm.coin} onChange={e => setTwapForm(p => ({ ...p, coin: e.target.value }))}
+                    className="bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50" />
+                  <div className="flex gap-2">
+                    <button onClick={() => setTwapForm(p => ({ ...p, side: 'BUY' }))} className={`flex-1 text-[10px] font-bold py-1.5 rounded-lg border transition ${twapForm.side === 'BUY' ? 'bg-emerald-950 text-emerald-400 border-emerald-800/30' : 'bg-zinc-900 text-zinc-500 border-white/10'}`}>BUY</button>
+                    <button onClick={() => setTwapForm(p => ({ ...p, side: 'SELL' }))} className={`flex-1 text-[10px] font-bold py-1.5 rounded-lg border transition ${twapForm.side === 'SELL' ? 'bg-rose-950 text-rose-400 border-rose-800/30' : 'bg-zinc-900 text-zinc-500 border-white/10'}`}>SELL</button>
+                  </div>
+                  <input placeholder="Size" value={twapForm.size} onChange={e => setTwapForm(p => ({ ...p, size: e.target.value }))}
+                    className="bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50" />
+                  <input placeholder="Duration (s)" value={twapForm.duration} onChange={e => setTwapForm(p => ({ ...p, duration: e.target.value }))}
+                    className="bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50" />
+                  <input placeholder="Slices" value={twapForm.slices} onChange={e => setTwapForm(p => ({ ...p, slices: e.target.value }))}
+                    className="bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50" />
+                  <button onClick={() => handleExec('/api/execution/twap', twapForm)}
+                    className="bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 text-xs font-bold px-4 py-2 rounded-lg transition mt-1">Execute TWAP</button>
+                </div>
+              </div>
+              {/* VWAP */}
+              <div className="glass-panel rounded-lg p-4 border border-white/5">
+                <h4 className="text-[11px] font-bold text-cyan-400 mb-3 tracking-wider">VWAP — Volume-Weighted</h4>
+                <div className="flex flex-col gap-2">
+                  <input placeholder="Coin (e.g. BTC)" value={vwapForm.coin} onChange={e => setVwapForm(p => ({ ...p, coin: e.target.value }))}
+                    className="bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50" />
+                  <div className="flex gap-2">
+                    <button onClick={() => setVwapForm(p => ({ ...p, side: 'BUY' }))} className={`flex-1 text-[10px] font-bold py-1.5 rounded-lg border transition ${vwapForm.side === 'BUY' ? 'bg-emerald-950 text-emerald-400 border-emerald-800/30' : 'bg-zinc-900 text-zinc-500 border-white/10'}`}>BUY</button>
+                    <button onClick={() => setVwapForm(p => ({ ...p, side: 'SELL' }))} className={`flex-1 text-[10px] font-bold py-1.5 rounded-lg border transition ${vwapForm.side === 'SELL' ? 'bg-rose-950 text-rose-400 border-rose-800/30' : 'bg-zinc-900 text-zinc-500 border-white/10'}`}>SELL</button>
+                  </div>
+                  <input placeholder="Size" value={vwapForm.size} onChange={e => setVwapForm(p => ({ ...p, size: e.target.value }))}
+                    className="bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50" />
+                  <input placeholder="Duration (s)" value={vwapForm.duration} onChange={e => setVwapForm(p => ({ ...p, duration: e.target.value }))}
+                    className="bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50" />
+                  <input placeholder="Slices" value={vwapForm.slices} onChange={e => setVwapForm(p => ({ ...p, slices: e.target.value }))}
+                    className="bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50" />
+                  <button onClick={() => handleExec('/api/execution/vwap', vwapForm)}
+                    className="bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 text-xs font-bold px-4 py-2 rounded-lg transition mt-1">Execute VWAP</button>
+                </div>
+              </div>
+              {/* Iceberg */}
+              <div className="glass-panel rounded-lg p-4 border border-white/5">
+                <h4 className="text-[11px] font-bold text-cyan-400 mb-3 tracking-wider">ICEBERG — Hidden Liquidity</h4>
+                <div className="flex flex-col gap-2">
+                  <input placeholder="Coin (e.g. BTC)" value={icebergForm.coin} onChange={e => setIcebergForm(p => ({ ...p, coin: e.target.value }))}
+                    className="bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50" />
+                  <div className="flex gap-2">
+                    <button onClick={() => setIcebergForm(p => ({ ...p, side: 'BUY' }))} className={`flex-1 text-[10px] font-bold py-1.5 rounded-lg border transition ${icebergForm.side === 'BUY' ? 'bg-emerald-950 text-emerald-400 border-emerald-800/30' : 'bg-zinc-900 text-zinc-500 border-white/10'}`}>BUY</button>
+                    <button onClick={() => setIcebergForm(p => ({ ...p, side: 'SELL' }))} className={`flex-1 text-[10px] font-bold py-1.5 rounded-lg border transition ${icebergForm.side === 'SELL' ? 'bg-rose-950 text-rose-400 border-rose-800/30' : 'bg-zinc-900 text-zinc-500 border-white/10'}`}>SELL</button>
+                  </div>
+                  <input placeholder="Total Size" value={icebergForm.totalSize} onChange={e => setIcebergForm(p => ({ ...p, totalSize: e.target.value }))}
+                    className="bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50" />
+                  <input placeholder="Visible Size" value={icebergForm.visibleSize} onChange={e => setIcebergForm(p => ({ ...p, visibleSize: e.target.value }))}
+                    className="bg-zinc-900 border border-white/10 rounded-lg text-xs font-mono text-cyan-300 px-3 py-2 outline-none focus:border-cyan-500/50" />
+                  <button onClick={() => handleExec('/api/execution/iceberg', icebergForm)}
+                    className="bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 text-xs font-bold px-4 py-2 rounded-lg transition mt-1">Execute Iceberg</button>
+                </div>
+              </div>
+            </div>
+            {execStatus && (
+              <div className="bg-zinc-950 border border-white/5 rounded-lg p-3 font-mono text-[10px] text-cyan-400">
+                <span className="text-zinc-500">[EXEC]</span> {execStatus}
+              </div>
+            )}
+          </div>
+
+          {/* ============================================================ */}
+          {/* NEW PANEL 5: Strategy Diagnostics Monitor */}
+          {/* ============================================================ */}
+          <div className="glass-panel rounded-xl p-5">
+            <h3 className="text-xs font-semibold tracking-wider text-slate-400 mb-4 uppercase flex items-center gap-1.5">
+              <Gauge className="h-3.5 w-3.5 text-cyan-400" />
+              Strategy Diagnostics Monitor
+            </h3>
+            {!stratDiag ? (
+              <p className="text-zinc-500 text-xs">Awaiting strategy evaluation feed from engine...</p>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {/* Momentum Trend */}
+                <div className="glass-panel rounded-lg p-4 border border-white/5">
+                  <div className="text-[10px] text-zinc-500 mb-2">Momentum Trend</div>
+                  <span className={`inline-block px-3 py-1 rounded text-xs font-bold font-mono ${
+                    (stratDiag.momentum?.signal || stratDiag.momentum_trend || 'FLAT').toUpperCase() === 'LONG'
+                      ? 'bg-emerald-950 text-emerald-400 border border-emerald-800/30'
+                      : (stratDiag.momentum?.signal || stratDiag.momentum_trend || 'FLAT').toUpperCase() === 'SHORT'
+                        ? 'bg-rose-950 text-rose-400 border border-rose-800/30'
+                        : 'bg-zinc-800 text-zinc-400 border border-zinc-700/30'
+                  }`}>
+                    {(stratDiag.momentum?.signal || stratDiag.momentum_trend || 'FLAT').toUpperCase()}
+                  </span>
+                </div>
+                {/* Bollinger Breakout */}
+                <div className="glass-panel rounded-lg p-4 border border-white/5">
+                  <div className="text-[10px] text-zinc-500 mb-2">Bollinger Breakout</div>
+                  <span className={`inline-block px-3 py-1 rounded text-xs font-bold font-mono ${
+                    (stratDiag.bollinger?.signal || stratDiag.bollinger_breakout || 'FLAT').toUpperCase() === 'LONG'
+                      ? 'bg-emerald-950 text-emerald-400 border border-emerald-800/30'
+                      : (stratDiag.bollinger?.signal || stratDiag.bollinger_breakout || 'FLAT').toUpperCase() === 'SHORT'
+                        ? 'bg-rose-950 text-rose-400 border border-rose-800/30'
+                        : 'bg-zinc-800 text-zinc-400 border border-zinc-700/30'
+                  }`}>
+                    {(stratDiag.bollinger?.signal || stratDiag.bollinger_breakout || 'FLAT').toUpperCase()}
+                  </span>
+                </div>
+                {/* Grid Trading */}
+                <div className="glass-panel rounded-lg p-4 border border-white/5">
+                  <div className="text-[10px] text-zinc-500 mb-2">Grid Trading Levels</div>
+                  <div className="flex gap-4 font-mono text-sm">
+                    <div>
+                      <span className="text-[10px] text-zinc-500 block">Buy Levels</span>
+                      <span className="font-extrabold text-emerald-400">{stratDiag.grid?.buy_levels ?? stratDiag.grid_buy_levels ?? 0}</span>
+                    </div>
+                    <div>
+                      <span className="text-[10px] text-zinc-500 block">Sell Levels</span>
+                      <span className="font-extrabold text-rose-400">{stratDiag.grid?.sell_levels ?? stratDiag.grid_sell_levels ?? 0}</span>
+                    </div>
+                  </div>
+                </div>
+                {/* Market Making */}
+                <div className="glass-panel rounded-lg p-4 border border-white/5">
+                  <div className="text-[10px] text-zinc-500 mb-2">Market Making</div>
+                  <div className="flex gap-4 font-mono text-sm mb-2">
+                    <div>
+                      <span className="text-[10px] text-zinc-500 block">Bid</span>
+                      <span className="font-extrabold text-emerald-400">${parseFloat(stratDiag.market_making?.bid ?? stratDiag.mm_bid ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                    </div>
+                    <div>
+                      <span className="text-[10px] text-zinc-500 block">Ask</span>
+                      <span className="font-extrabold text-rose-400">${parseFloat(stratDiag.market_making?.ask ?? stratDiag.mm_ask ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                    </div>
+                  </div>
+                  {(stratDiag.market_making?.adverse_selection_halt ?? stratDiag.adverse_selection_halt) && (
+                    <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-rose-950 text-rose-400 border border-rose-800/30 animate-pulse">
+                      ⚠ ADVERSE SELECTION HALT
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
 
         </div>
 
