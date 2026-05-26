@@ -220,8 +220,10 @@ def get_dashboard_metrics():
     sentiment_logs = db.get_latest_sentiment(limit=5)
     
     # Current active market prices
-    btc_price = tracker.get_market_state("BTC").get("mid", 67000.0)
-    eth_price = tracker.get_market_state("ETH").get("mid", 3500.0)
+    btc_price = tracker.get_market_state("BTC").get("mid", 75500.0)
+    eth_price = tracker.get_market_state("ETH").get("mid", 2070.0)
+    doge_price = tracker.get_market_state("DOGE").get("mid", 0.17)
+    sui_price = tracker.get_market_state("SUI").get("mid", 3.50)
     
     margin_summary = {}
     if user_state and "marginSummary" in user_state:
@@ -230,12 +232,16 @@ def get_dashboard_metrics():
     return {
         "bot_running": BOT_STATUS["is_running"] and not risk_manager.is_halted,
         "is_halted": risk_manager.is_halted,
-        "account_value": margin_summary.get("accountValue", "10000.0"),
+        "account_value": margin_summary.get("accountValue", "7.42"),
         "total_margin_used": margin_summary.get("totalMarginUsed", "0.0"),
-        "withdrawable": margin_summary.get("withdrawable", "10000.0"),
+        "withdrawable": margin_summary.get("withdrawable", "7.42"),
         "positions": positions,
         "btc_price": btc_price,
         "eth_price": eth_price,
+        "doge_price": doge_price,
+        "sui_price": sui_price,
+        "asset_a": strategy_engine.asset_a,
+        "asset_b": strategy_engine.asset_b,
         "current_zscore": strategy_engine.current_zscore,
         "current_spread": strategy_engine.current_spread,
         "latest_sentiment": strategy_engine.latest_sentiment,

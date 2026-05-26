@@ -133,14 +133,21 @@ def test_altcoin_pairs_scanner():
 async def test_execution_algorithms():
     """Verify that TWAP, VWAP, and Iceberg slicing execution models operate mathematically correct."""
     from backend.services.execution_algos import execution_algos
+    from backend.services.hyperliquid_client import hl_client
     
-    # Run tests in simulated dry-run
-    await execution_algos.execute_twap("BTC", is_buy=True, total_size=0.1, duration_seconds=1, slices=2)
-    await execution_algos.execute_vwap("BTC", is_buy=False, total_size=0.1, duration_seconds=1, slices=2)
-    await execution_algos.execute_iceberg("BTC", is_buy=True, total_size=0.1, visible_size=0.04)
+    original_active = hl_client.is_active
+    hl_client.is_active = False
     
-    # Check that mock logs are generated correctly in the database
-    from backend.services.database import db
-    recent_logs = db.get_logs(limit=20)
-    assert any("TWAP" in log["message"] for log in recent_logs)
+    try:
+        # Run tests in simulated dry-run
+        await execution_algos.execute_twap("BTC", is_buy=True, total_size=0.1, duration_seconds=1, slices=2)
+        await execution_algos.execute_vwap("BTC", is_buy=False, total_size=0.1, duration_seconds=1, slices=2)
+        await execution_algos.execute_iceberg("BTC", is_buy=True, total_size=0.1, visible_size=0.04)
+        
+        # Check that mock logs are generated correctly in the database
+        from backend.services.database import db
+        recent_logs = db.get_logs(limit=20)
+        assert any("TWAP" in log["message"] for log in recent_logs)
+    finally:
+        hl_client.is_active = original_active
 

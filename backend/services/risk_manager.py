@@ -12,7 +12,7 @@ class RiskManager:
         
         # Internal state to manage circuit breakers
         self.is_halted = False
-        self.daily_starting_equity = 10000.0 # Will fetch from user state dynamically
+        self.daily_starting_equity = 7.42 # Will fetch from user state dynamically
         self.last_sync_time = 0.0
 
     def sync_equity(self):
@@ -23,8 +23,12 @@ class RiskManager:
             user_state = hl_client.get_user_state()
             if user_state and "marginSummary" in user_state:
                 summary = user_state["marginSummary"]
-                current_equity = float(summary.get("accountValue", 10000.0))
-                self.daily_starting_equity = current_equity
+                current_equity = float(summary.get("accountValue", 7.42))
+                # Guard against zero equity from API (funds may be in spot wallet)
+                if current_equity > 0:
+                    self.daily_starting_equity = current_equity
+                else:
+                    self.daily_starting_equity = max(self.daily_starting_equity, 7.42)
                 self.last_sync_time = now
                 db.log_system("RISK", f"Synced Starting Equity: ${self.daily_starting_equity:.2f}")
 
@@ -52,22 +56,33 @@ class RiskManager:
             return False, "Failed to fetch user state from Hyperliquid", 0.0
             
         margin_summary = user_state.get("marginSummary", {})
-        account_value = float(margin_summary.get("accountValue", 10000.0))
+        account_value = float(margin_summary.get("accountValue", 7.42))
         margin_used = float(margin_summary.get("totalMarginUsed", 0.0))
         
+        # Guard: If API returns 0 for account value, use daily_starting_equity fallback
+        if account_value <= 0:
+            account_value = max(self.daily_starting_equity, 7.42)
+            db.log_system("RISK", f"Account value reported as 0. Using fallback equity: ${account_value:.2f}")
+        
         # 3. Daily Drawdown Circuit Breaker
-        current_drawdown = (account_value - self.daily_starting_equity) / self.daily_starting_equity
-        if current_drawdown <= -self.daily_drawdown_limit:
-            self.is_halted = True
-            hl_client.cancel_all_orders()
-            db.log_system("CRITICAL", f"DAILY DRAWDOWN LIMIT BREACHED: {current_drawdown*100:.2f}%. Activating emergency HALT.")
-            return False, "Daily drawdown limit breached, circuit breaker activated!", 0.0
+        if self.daily_starting_equity > 0:
+            current_drawdown = (account_value - self.daily_starting_equity) / self.daily_starting_equity
+            if current_drawdown <= -self.daily_drawdown_limit:
+                self.is_halted = True
+                hl_client.cancel_all_orders()
+                db.log_system("CRITICAL", f"DAILY DRAWDOWN LIMIT BREACHED: {current_drawdown*100:.2f}%. Activating emergency HALT.")
+                return False, "Daily drawdown limit breached, circuit breaker activated!", 0.0
             
         # 4. Max Exposure Check
-        # Reject new entries if total margin used exceeds 20% of account equity
+        # Adjust max exposure limit dynamically for small accounts to allow meeting L1 minimums
+        active_max_exposure = self.max_exposure_pct
+        if account_value < 50.0:
+            active_max_exposure = 0.85 # Allow up to 85% margin usage for micro accounts
+            
+        # Reject new entries if total margin used exceeds max_exposure of account equity
         is_exit = side == "FLAT"
-        if not is_exit and (margin_used / account_value) >= self.max_exposure_pct:
-            return False, f"Max exposure limit reached! Active Margin Ratio: {margin_used/account_value*100:.2f}%", 0.0
+        if not is_exit and account_value > 0 and (margin_used / account_value) >= active_max_exposure:
+            return False, f"Max exposure limit reached! Active Margin Ratio: {margin_used/account_value*100:.2f}% (Limit: {active_max_exposure*100:.1f}%)", 0.0
 
         if is_exit:
             # Flat/Exit order has no risk limit checks as it reduces risk
@@ -97,20 +112,43 @@ class RiskManager:
             risk_fraction = self.risk_per_trade_pct
             db.log_system("RISK", f"Under-sampled history ({total_trades} trades). Using default fixed fractional alloc: {risk_fraction*100:.2f}%")
             
+        # Hyperliquid requires a strict minimum order value of $10 notional.
+        # We enforce $11 here to give it a safety buffer.
         risk_amount = account_value * risk_fraction
+        risk_amount = max(risk_amount, 11.0)
         
         # Sizing relative to price (position size = risk_amount / price)
+        if price <= 0:
+            return False, "Invalid price (zero or negative)", 0.0
         calculated_size = risk_amount / price
         
-        # Establish sensible asset size boundaries
-        if coin == "BTC":
-            calculated_size = max(0.0001, round(calculated_size, 4))
-        elif coin == "ETH":
-            calculated_size = max(0.001, round(calculated_size, 3))
-        else:
-            calculated_size = max(0.01, round(calculated_size, 2))
+        # Define step size (decimals) and minimum size per coin
+        coin_specs = {
+            "BTC": (4, 0.0001),
+            "ETH": (3, 0.001),
+            "DOGE": (0, 1.0),
+            "SUI": (1, 0.1),
+            "SOL": (2, 0.01),
+            "NEAR": (1, 0.1),
+            "AVAX": (1, 0.1)
+        }
+        
+        decimals, min_size = coin_specs.get(coin, (2, 0.01))
+        
+        # Initial rounded size
+        rounded_size = round(calculated_size, decimals)
+        if rounded_size < min_size:
+            rounded_size = min_size
             
-        return True, "Order approved by risk gatekeeper", calculated_size
+        # Ensure notional value is strictly >= $11.00 to satisfy Hyperliquid's minimum limit
+        if rounded_size * price < 11.0:
+            import math
+            required_size = 11.0 / price
+            step = 10 ** (-decimals) if decimals > 0 else 1.0
+            steps = math.ceil(required_size / step)
+            rounded_size = round(steps * step, decimals)
+            
+        return True, "Order approved by risk gatekeeper", rounded_size
 
     def trigger_emergency_kill(self):
         """Manual activation of kill switch."""

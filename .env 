@@ -1,0 +1,17 @@
+# ==============================================================================
+# HYPERLIQUID LLM ALGORITHMIC TRADING BOT ENVIRONMENT SETTINGS
+# ==============================================================================
+
+# Private key of your authorized Agent Wallet (trading permissions only).
+# Keep empty to run the bot in 100% simulated dry-run mode.
+AGENT_PRIVATE_KEY=0x9a36b3080e833acb8200099a76b18ea0a335053901cb46b5dfc9b465d3353968
+
+# Optional: Master account address if trading on behalf of a vault or master wallet
+ACCOUNT_ADDRESS=0x01c57D5D102b9Ceb7269C6F719e041aFcFCE5D5C
+
+# Toggle: False for Testnet, True for real Mainnet trading
+IS_MAINNET=False
+
+# Optional: Free Gemini API Key for advanced narrative sentiment scraping.
+# Keep empty to use the free local NLP VADER analysis.
+GEMINI_API_KEY=your_gemini_api_key_here

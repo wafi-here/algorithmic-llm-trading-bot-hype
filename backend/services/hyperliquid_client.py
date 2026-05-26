@@ -96,16 +96,35 @@ class HyperliquidClient:
             return {"status": "ok", "response": {"type": "mock", "id": "MOCK_ORDER_ID"}}
 
         try:
-            # Set leverage to 3x default for risk management safety
+            # Set leverage dynamically: 10x default for micro accounts (< $50) to allow meeting L1 minimums, 3x for larger accounts
             try:
-                self.exchange.update_leverage(3, coin)
-            except Exception:
-                pass # Already set or handled
+                margin_user = Config.ACCOUNT_ADDRESS if Config.ACCOUNT_ADDRESS else self.wallet_address
+                user_state = self.info.user_state(margin_user)
+                account_val = 100.0
+                if user_state and "marginSummary" in user_state:
+                    account_val = float(user_state["marginSummary"].get("accountValue", 100.0))
+                
+                leverage_to_set = 10 if account_val < 50.0 else 3
+                self.exchange.update_leverage(leverage_to_set, coin)
+            except Exception as le:
+                db.log_system("WARNING", f"Could not adjust leverage dynamically for {coin}: {str(le)}")
 
-            # Round size and price according to Hyperliquid specifications
-            # We round size and price to 4 decimal places as a general baseline
-            rounded_size = round(size, 4)
-            rounded_price = round(price, 4)
+            # Round size and price according to exact Hyperliquid L1 tick and lot specifications
+            if coin == "BTC":
+                rounded_price = round(price, 0)
+                rounded_size = round(size, 4)
+            elif coin == "ETH":
+                rounded_price = round(price, 1)
+                rounded_size = round(size, 3)
+            elif coin == "DOGE":
+                rounded_price = round(price, 4)
+                rounded_size = round(size, 0)
+            elif coin == "SUI":
+                rounded_price = round(price, 4)
+                rounded_size = round(size, 1)
+            else:
+                rounded_price = round(price, 4)
+                rounded_size = round(size, 2)
             
             db.log_system("EXECUTION", f"Sending L1 Tx: {coin} | Buy: {is_buy} | Size: {rounded_size} | Px: {rounded_price} | ReduceOnly: {reduce_only}")
             

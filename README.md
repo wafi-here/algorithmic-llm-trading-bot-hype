@@ -62,7 +62,7 @@ docker compose up --build -d
 
 ### Step 4: Access your Visual Quant Dashboard
 Open your browser and navigate to:
-- **Dashboard UI:** [http://localhost:3000](http://localhost:3000)
+- **Dashboard UI:** [http://localhost:3001](http://localhost:3001)
 - **FastAPI Documentation:** [http://localhost:8000/docs](http://localhost:8000/docs)
 
 ---

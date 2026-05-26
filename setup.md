@@ -65,7 +65,7 @@ Both backend and frontend services are completely containerized. The `docker-com
 
 ### 2. Networking Topology
 - **`backend`**: Runs on port `8000`. Exposes FastAPI swagger docs, REST statistics endpoints, and log buffers.
-- **`frontend`**: Runs on port `3000`. Serves the Next.js visual dashboard, which polls price tick updates, trade states, and terminal logs from `http://localhost:8000`.
+- **`frontend`**: Runs on port `3001` (externally). Serves the Next.js visual dashboard, which polls price tick updates, trade states, and terminal logs from `http://localhost:8000`.
 
 ---
 

@@ -141,7 +141,7 @@ class OrderBookTracker:
             
         if not state or state.get("mid") == 0.0:
             # Fallback to realistic mock prices for testing if WS not connected
-            mock_prices = {"BTC": 67250.0, "ETH": 3520.0}
+            mock_prices = {"BTC": 67250.0, "ETH": 3520.0, "DOGE": 0.17, "SUI": 3.50, "SOL": 170.0, "NEAR": 5.0, "AVAX": 35.0}
             mid = mock_prices.get(coin, 100.0)
             return {
                 "mid": mid,
@@ -154,5 +154,5 @@ class OrderBookTracker:
         return state
 
 
-# Singleton instance tracking BTC and ETH by default
-tracker = OrderBookTracker(coins=["BTC", "ETH"])
+# Singleton instance tracking BTC, ETH, DOGE, and SUI
+tracker = OrderBookTracker(coins=["BTC", "ETH", "DOGE", "SUI"])

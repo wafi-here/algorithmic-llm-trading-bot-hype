@@ -5,6 +5,9 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     ports:
       - "8000:8000"
     volumes:
@@ -13,13 +16,13 @@ services:
     environment:
       - PORT=8000
       - ENV=development
-      - IS_MAINNET=False
+      - IS_MAINNET=${IS_MAINNET}
       - AGENT_PRIVATE_KEY=${AGENT_PRIVATE_KEY}
       - ACCOUNT_ADDRESS=${ACCOUNT_ADDRESS}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - MAX_EXPOSURE_PCT=0.20
       - RISK_PER_TRADE_PCT=0.01
-      - CIRCUIT_BREAKER_LATENCY_MS=100
+      - CIRCUIT_BREAKER_LATENCY_MS=2000
       - DAILY_DRAWDOWN_LIMIT_PCT=0.05
     restart: always
 
@@ -28,7 +31,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "3001:3000"
     volumes:
       - ./frontend:/app
       - /app/node_modules

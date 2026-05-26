@@ -36,9 +36,9 @@ export default function Home() {
   const [btEntryZ, setBtEntryZ] = useState('2.0');
   const [btExitZ, setBtExitZ] = useState('0.5');
   const [btWindow, setBtWindow] = useState('30');
-  const [twapForm, setTwapForm] = useState({ coin: 'BTC', side: 'BUY', size: '', duration: '', slices: '' });
-  const [vwapForm, setVwapForm] = useState({ coin: 'BTC', side: 'BUY', size: '', duration: '', slices: '' });
-  const [icebergForm, setIcebergForm] = useState({ coin: 'BTC', side: 'BUY', totalSize: '', visibleSize: '' });
+  const [twapForm, setTwapForm] = useState({ coin: 'DOGE', side: 'BUY', size: '', duration: '', slices: '' });
+  const [vwapForm, setVwapForm] = useState({ coin: 'DOGE', side: 'BUY', size: '', duration: '', slices: '' });
+  const [icebergForm, setIcebergForm] = useState({ coin: 'DOGE', side: 'BUY', totalSize: '', visibleSize: '' });
 
   // Fetch metrics and logs
   const fetchData = async () => {
@@ -81,10 +81,11 @@ export default function Home() {
   // Strategy diagnostics on a 5-second interval
   const fetchStratDiag = useCallback(async () => {
     try {
-      const res = await fetch(`${backendUrl}/api/strategies/evaluate-all?coin=BTC`);
+      const activeCoin = data?.asset_a || 'BTC';
+      const res = await fetch(`${backendUrl}/api/strategies/evaluate-all?coin=${activeCoin}`);
       if (res.ok) setStratDiag(await res.json());
     } catch (_) {}
-  }, [backendUrl]);
+  }, [backendUrl, data?.asset_a]);
 
   useEffect(() => {
     fetchStratDiag();
@@ -270,15 +271,27 @@ export default function Home() {
           <div className="glass-panel rounded-xl p-5">
             <h3 className="text-xs font-semibold tracking-wider text-slate-400 mb-4 uppercase">Market feeds (L2)</h3>
             <div className="flex flex-col gap-3 font-mono">
-              <div className="flex justify-between items-center p-2 rounded bg-white/5 border border-white/5">
-                <span className="text-sm font-bold text-white">BTC-PERP</span>
+              <div className="flex justify-between items-center p-2 rounded bg-cyan-500/5 border border-cyan-500/20">
+                <span className="text-sm font-bold text-cyan-300">DOGE-PERP</span>
                 <span className="text-sm font-semibold text-cyan-400">
+                  ${parseFloat(data?.doge_price || "0").toLocaleString(undefined, { minimumFractionDigits: 4 })}
+                </span>
+              </div>
+              <div className="flex justify-between items-center p-2 rounded bg-cyan-500/5 border border-cyan-500/20">
+                <span className="text-sm font-bold text-cyan-300">SUI-PERP</span>
+                <span className="text-sm font-semibold text-cyan-400">
+                  ${parseFloat(data?.sui_price || "0").toLocaleString(undefined, { minimumFractionDigits: 4 })}
+                </span>
+              </div>
+              <div className="flex justify-between items-center p-2 rounded bg-white/5 border border-white/5">
+                <span className="text-xs text-zinc-500">BTC-PERP</span>
+                <span className="text-xs text-zinc-400">
                   ${parseFloat(data?.btc_price || "0").toLocaleString(undefined, { minimumFractionDigits: 2 })}
                 </span>
               </div>
               <div className="flex justify-between items-center p-2 rounded bg-white/5 border border-white/5">
-                <span className="text-sm font-bold text-white">ETH-PERP</span>
-                <span className="text-sm font-semibold text-cyan-400">
+                <span className="text-xs text-zinc-500">ETH-PERP</span>
+                <span className="text-xs text-zinc-400">
                   ${parseFloat(data?.eth_price || "0").toLocaleString(undefined, { minimumFractionDigits: 2 })}
                 </span>
               </div>
@@ -312,7 +325,7 @@ export default function Home() {
           <div className="glass-panel rounded-xl p-5 flex-grow">
             <h3 className="text-xs font-semibold tracking-wider text-slate-400 mb-4 uppercase flex items-center gap-1.5">
               <Activity className="h-3.5 w-3.5 text-cyan-400" />
-              Z-Score Arbitrage Spread
+              Z-Score Spread ({data?.asset_a || 'BTC'} / {data?.asset_b || 'ETH'})
             </h3>
             
             <div className="text-center my-6">
