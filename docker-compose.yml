@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend
+      - sqlite_data:/app
+    environment:
+      - PORT=8000
+      - ENV=development
+      - IS_MAINNET=False
+      - AGENT_PRIVATE_KEY=${AGENT_PRIVATE_KEY}
+      - ACCOUNT_ADDRESS=${ACCOUNT_ADDRESS}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - MAX_EXPOSURE_PCT=0.20
+      - RISK_PER_TRADE_PCT=0.01
+      - CIRCUIT_BREAKER_LATENCY_MS=100
+      - DAILY_DRAWDOWN_LIMIT_PCT=0.05
+    restart: always
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    restart: always
+
+volumes:
+  sqlite_data:

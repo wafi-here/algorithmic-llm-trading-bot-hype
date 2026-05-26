@@ -1,0 +1,17 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Database
+trading_bot.db
+*.sqlite3
+
+# Environment variables
+.env
+
+# Cache & OS files
+__pycache__/
+*.py[cod]
+.DS_Store
+.coverage
