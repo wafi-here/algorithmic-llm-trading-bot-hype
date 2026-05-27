@@ -16,7 +16,7 @@ class RiskManager:
         self.last_sync_time = 0.0
 
     def sync_equity(self):
-        """Fetches latest wallet equity and resets starting equity if daily cycle has passed."""
+        """Fetches latest wallet equity. Only resets daily_starting_equity at true day boundaries (midnight UTC)."""
         now = time.time()
         # Sync every 10 minutes
         if now - self.last_sync_time > 600:
@@ -25,12 +25,19 @@ class RiskManager:
                 summary = user_state["marginSummary"]
                 current_equity = float(summary.get("accountValue", 7.42))
                 # Guard against zero equity from API (funds may be in spot wallet)
-                if current_equity > 0:
+                if current_equity <= 0:
+                    current_equity = max(self.daily_starting_equity, 7.42)
+
+                # Only reset daily_starting_equity at actual day boundaries or on first sync
+                from datetime import datetime, timezone
+                current_date = datetime.now(timezone.utc).date()
+                if not hasattr(self, '_last_equity_date') or self._last_equity_date != current_date:
                     self.daily_starting_equity = current_equity
-                else:
-                    self.daily_starting_equity = max(self.daily_starting_equity, 7.42)
+                    self._last_equity_date = current_date
+                    db.log_system("RISK", f"New trading day detected. Daily Starting Equity set to: ${self.daily_starting_equity:.2f}")
+
                 self.last_sync_time = now
-                db.log_system("RISK", f"Synced Starting Equity: ${self.daily_starting_equity:.2f}")
+                db.log_system("RISK", f"Equity sync completed. Current: ${current_equity:.2f} | Daily Start: ${self.daily_starting_equity:.2f}")
 
     def evaluate_order(self, coin: str, side: str, price: float, timestamp_ms: float) -> tuple[bool, str, float]:
         """

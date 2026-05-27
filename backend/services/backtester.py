@@ -35,7 +35,7 @@ class HistoricalBacktester:
         })
         return df
 
-    def run_backtest(self, df_data: pd.DataFrame, entry_z=2.0, exit_z=0.5, sentiment_score=0.0):
+    def run_backtest(self, df_data: pd.DataFrame, entry_z=2.0, exit_z=0.5, sentiment_score=0.0, window=30):
         """
         Simulates statistical arbitrage pairs trading strategy performance.
         Returns: Dict containing performance summaries and chronological balance curve.
@@ -45,7 +45,6 @@ class HistoricalBacktester:
         timestamps = df_data["timestamp"].tolist()
         
         hedge_ratio = 19.0
-        window = 30
         
         spreads = btc - (hedge_ratio * eth)
         

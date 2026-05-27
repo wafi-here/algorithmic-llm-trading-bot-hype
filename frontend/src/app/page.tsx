@@ -136,31 +136,45 @@ export default function Home() {
       const res = await fetch(`${backendUrl}/api/backtest`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ entry_z: parseFloat(btEntryZ), exit_z: parseFloat(btExitZ), window: parseInt(btWindow) })
+        body: JSON.stringify({ entry_threshold: parseFloat(btEntryZ), exit_threshold: parseFloat(btExitZ), window_size: parseInt(btWindow) })
       });
       if (res.ok) setBacktestResult(await res.json());
     } catch (_) { setBacktestResult({ error: 'Backtest request failed' }); }
     finally { setBacktestLoading(false); }
   };
 
-  // Execution algo handler
+  // Execution algo handler — transforms form data to match backend Pydantic schemas
   const handleExec = async (endpoint: string, payload: any) => {
     setExecStatus('Submitting...');
     try {
+      // Transform form fields to match backend API schemas
+      let apiPayload: any = { coin: payload.coin, is_buy: payload.side === 'BUY' };
+      if (endpoint.includes('iceberg')) {
+        apiPayload.total_size = parseFloat(payload.totalSize) || 0;
+        apiPayload.visible_size = parseFloat(payload.visibleSize) || 0;
+      } else {
+        apiPayload.total_size = parseFloat(payload.size) || 0;
+        apiPayload.duration_seconds = parseInt(payload.duration) || 30;
+        apiPayload.slices = parseInt(payload.slices) || 3;
+      }
       const res = await fetch(`${backendUrl}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(apiPayload)
       });
       const result = await res.json();
       setExecStatus(result?.message || result?.status || 'Order submitted');
     } catch (_) { setExecStatus('Execution request failed'); }
   };
 
-  // Funding toggle
+  // Funding toggle — sends proper JSON body with current inverse state
   const handleFundingToggle = async () => {
     try {
-      await fetch(`${backendUrl}/api/funding-arbitrage/toggle`, { method: 'POST' });
+      await fetch(`${backendUrl}/api/funding-arbitrage/toggle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !fundingData?.agent_active })
+      });
       fetchData();
     } catch (_) {}
   };
@@ -243,12 +257,17 @@ export default function Home() {
           <div className="glass-panel rounded-xl p-5 relative overflow-hidden">
             <div className="absolute top-0 right-0 h-24 w-24 bg-cyan-500/5 rounded-full blur-2xl" />
             <div className="flex justify-between items-start mb-4">
-              <span className="text-xs font-semibold tracking-wider text-slate-400">MARGIN BALANCE</span>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold tracking-wider text-slate-400">MARGIN BALANCE</span>
+                {data?.is_mock && (
+                  <span className="text-[9px] bg-yellow-950 text-yellow-400 border border-yellow-800/30 px-1.5 py-0.5 rounded font-bold uppercase animate-pulse">SIM</span>
+                )}
+              </div>
               <DollarSign className="h-4 w-4 text-cyan-400" />
             </div>
             
             <div className="text-2xl md:text-3xl font-extrabold text-white tracking-tight font-mono">
-              ${parseFloat(data?.account_value || "10000.00").toLocaleString(undefined, { minimumFractionDigits: 2 })}
+              ${parseFloat(data?.account_value || "0.00").toLocaleString(undefined, { minimumFractionDigits: 2 })}
             </div>
             
             <div className="mt-4 pt-4 border-t border-white/5 grid grid-cols-2 gap-2 text-xs">
@@ -261,7 +280,7 @@ export default function Home() {
               <div>
                 <span className="text-zinc-500 block">Withdrawable</span>
                 <span className="font-semibold text-slate-200 font-mono">
-                  ${parseFloat(data?.withdrawable || "10000.00").toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                  ${parseFloat(data?.withdrawable || "0.00").toLocaleString(undefined, { minimumFractionDigits: 2 })}
                 </span>
               </div>
             </div>
@@ -269,7 +288,16 @@ export default function Home() {
 
           {/* Card 2: Market State Feed */}
           <div className="glass-panel rounded-xl p-5">
-            <h3 className="text-xs font-semibold tracking-wider text-slate-400 mb-4 uppercase">Market feeds (L2)</h3>
+            <div className="flex items-center gap-2 mb-4">
+              <h3 className="text-xs font-semibold tracking-wider text-slate-400 uppercase">Market feeds (L2)</h3>
+              <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold uppercase ${
+                data?.markets_live
+                  ? 'bg-emerald-950 text-emerald-400 border border-emerald-800/30'
+                  : 'bg-yellow-950 text-yellow-400 border border-yellow-800/30 animate-pulse'
+              }`}>
+                {data?.markets_live ? 'LIVE' : 'OFFLINE'}
+              </span>
+            </div>
             <div className="flex flex-col gap-3 font-mono">
               <div className="flex justify-between items-center p-2 rounded bg-cyan-500/5 border border-cyan-500/20">
                 <span className="text-sm font-bold text-cyan-300">DOGE-PERP</span>
@@ -583,7 +611,7 @@ export default function Home() {
                 onClick={handleFundingToggle}
                 className="bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 text-xs font-bold px-4 py-2 rounded-lg transition"
               >
-                {fundingData?.enabled ? 'Disable' : 'Enable'} Arbitrage
+                {fundingData?.agent_active ? 'Disable' : 'Enable'} Arbitrage
               </button>
             </div>
             {!fundingData || !fundingData.opportunities || fundingData.opportunities.length === 0 ? (
@@ -660,9 +688,9 @@ export default function Home() {
               <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
                 {[
                   { label: 'Total Trades', value: backtestResult.total_trades ?? '—' },
-                  { label: 'Win Rate %', value: backtestResult.win_rate != null ? `${backtestResult.win_rate.toFixed(1)}%` : '—' },
+                  { label: 'Win Rate %', value: backtestResult.win_rate != null ? `${(backtestResult.win_rate * 100).toFixed(1)}%` : '—' },
                   { label: 'Sharpe Ratio', value: backtestResult.sharpe_ratio != null ? backtestResult.sharpe_ratio.toFixed(3) : '—' },
-                  { label: 'Max Drawdown %', value: backtestResult.max_drawdown != null ? `${backtestResult.max_drawdown.toFixed(2)}%` : '—' },
+                  { label: 'Max Drawdown %', value: backtestResult.max_drawdown != null ? `${(backtestResult.max_drawdown * 100).toFixed(2)}%` : '—' },
                   { label: 'Final Balance', value: backtestResult.final_balance != null ? `$${parseFloat(backtestResult.final_balance).toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '—' },
                   { label: 'Total PnL', value: backtestResult.total_pnl != null ? backtestResult.total_pnl : '—', isPnl: true },
                 ].map((m, i) => (
@@ -803,11 +831,11 @@ export default function Home() {
                   <div className="flex gap-4 font-mono text-sm">
                     <div>
                       <span className="text-[10px] text-zinc-500 block">Buy Levels</span>
-                      <span className="font-extrabold text-emerald-400">{stratDiag.grid?.buy_levels ?? stratDiag.grid_buy_levels ?? 0}</span>
+                      <span className="font-extrabold text-emerald-400">{stratDiag.active_grid_levels?.buy_levels?.length ?? 0}</span>
                     </div>
                     <div>
                       <span className="text-[10px] text-zinc-500 block">Sell Levels</span>
-                      <span className="font-extrabold text-rose-400">{stratDiag.grid?.sell_levels ?? stratDiag.grid_sell_levels ?? 0}</span>
+                      <span className="font-extrabold text-rose-400">{stratDiag.active_grid_levels?.sell_levels?.length ?? 0}</span>
                     </div>
                   </div>
                 </div>
@@ -817,14 +845,14 @@ export default function Home() {
                   <div className="flex gap-4 font-mono text-sm mb-2">
                     <div>
                       <span className="text-[10px] text-zinc-500 block">Bid</span>
-                      <span className="font-extrabold text-emerald-400">${parseFloat(stratDiag.market_making?.bid ?? stratDiag.mm_bid ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                      <span className="font-extrabold text-emerald-400">${parseFloat(stratDiag.market_making_skew?.bid_price ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                     </div>
                     <div>
                       <span className="text-[10px] text-zinc-500 block">Ask</span>
-                      <span className="font-extrabold text-rose-400">${parseFloat(stratDiag.market_making?.ask ?? stratDiag.mm_ask ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                      <span className="font-extrabold text-rose-400">${parseFloat(stratDiag.market_making_skew?.ask_price ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                     </div>
                   </div>
-                  {(stratDiag.market_making?.adverse_selection_halt ?? stratDiag.adverse_selection_halt) && (
+                  {stratDiag.market_making_skew?.adverse_selection_halt && (
                     <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-rose-950 text-rose-400 border border-rose-800/30 animate-pulse">
                       ⚠ ADVERSE SELECTION HALT
                     </span>

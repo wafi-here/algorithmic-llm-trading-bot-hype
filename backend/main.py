@@ -18,6 +18,7 @@ from backend.services.backtester import backtester
 from backend.services.funding_arbitrage import funding_arb_agent
 from backend.services.pairs_scanner import scanner
 from backend.services.execution_algos import execution_algos
+from backend.services.universe_manager import universe_manager
 
 # State holder to check bot execution status
 BOT_STATUS = {
@@ -40,8 +41,17 @@ async def trading_bot_loop():
     except Exception as e:
         db.log_system("WARNING", f"Initial sentiment scrape failed: {str(e)}")
         
+    # Initial Universe Scan
+    try:
+        top_coins = universe_manager.update_universe(max_coins=10)
+        tracker.update_target_coins(top_coins)
+        strategy_engine.sync_with_universe(top_coins)
+    except Exception as e:
+        db.log_system("ERROR", f"Initial universe scan failed: {str(e)}")
+        
     last_sentiment_scrape = time.time()
     last_db_prune = time.time()
+    last_universe_scan = time.time()
     
     while BOT_STATUS["is_running"]:
         try:
@@ -60,73 +70,112 @@ async def trading_bot_loop():
                 db.prune_stale_data(days_threshold=2)
                 last_db_prune = now
 
+            # 3. Dynamic Universe Rescan every hour (3600 seconds)
+            if now - last_universe_scan > 3600:
+                top_coins = universe_manager.update_universe(max_coins=10)
+                tracker.update_target_coins(top_coins)
+                strategy_engine.sync_with_universe(top_coins)
+                last_universe_scan = now
+
 
             # 2. Run strategy signal check
             # Calculates Z-scores and generates trade signals (LONG/SHORT/FLAT)
             strat_result = strategy_engine.calculate_signals()
             
+            # Generate consensus signals from multiple strategies
+            final_signals = {}
             if strat_result and "signals" in strat_result:
-                signals = strat_result["signals"]
-                zscore = strat_result["zscore"]
+                final_signals = strat_result["signals"]
                 
-                # Check signals for both assets in our pairs trade
-                for coin, action in signals.items():
-                    if not action:
-                        continue
-                        
-                    # Fetch latest market state for pricing
-                    market_state = tracker.get_market_state(coin)
-                    mid_px = market_state.get("mid", 0.0)
+            # Evaluate Diagnostic Strategies for live execution
+            # If Momentum and Volatility Breakout agree on a trend, we allow execution
+            for coin in [strategy_engine.asset_a, strategy_engine.asset_b]:
+                mom_sig = strategy_engine.calculate_momentum_signals(coin)
+                brk_sig = strategy_engine.calculate_volatility_breakout(coin)
+                
+                # Consensus Check: Both indicate LONG or SHORT
+                if mom_sig and brk_sig and mom_sig == brk_sig and mom_sig != "FLAT":
+                    db.log_system("STRATEGY_CONSENSUS", f"Strong {mom_sig} consensus from Momentum + Breakout on {coin}")
+                    # Prioritize Z-Score (Statistical Arbitrage) if it already fired, otherwise use consensus
+                    if coin not in final_signals or final_signals[coin] is None:
+                        final_signals[coin] = mom_sig
+                
+            # Process final signals
+            for coin, action in final_signals.items():
+                if not action:
+                    continue
                     
-                    if mid_px == 0.0:
-                        continue
-                        
-                    timestamp_ms = int(time.time() * 1000)
+                # Fetch latest market state for pricing
+                market_state = tracker.get_market_state(coin)
+                mid_px = market_state.get("mid", 0.0)
+                
+                if mid_px == 0.0:
+                    continue
                     
-                    # Evaluate side vs current active positions to prevent double entries
-                    active_positions = hl_client.get_positions()
-                    has_position = any(p["coin"] == coin for p in active_positions)
-                    
-                    # Prevent entering identical position twice
-                    if action == "LONG" and has_position:
-                        continue
-                    if action == "SHORT" and has_position:
-                        continue
-                    if action == "FLAT" and not has_position:
-                        continue
+                timestamp_ms = int(time.time() * 1000)
+                
+                # Evaluate side vs current active positions to prevent double entries
+                active_positions = hl_client.get_positions()
+                has_position = any(p["coin"] == coin for p in active_positions)
+                
+                # Prevent entering identical position twice
+                if action == "LONG" and has_position:
+                    continue
+                if action == "SHORT" and has_position:
+                    continue
+                if action == "FLAT" and not has_position:
+                    continue
 
-                    # 3. Risk Gatekeeper Evaluation
-                    approved, reason, size = risk_manager.evaluate_order(
-                        coin=coin,
-                        side=action,
-                        price=mid_px,
-                        timestamp_ms=timestamp_ms
-                    )
+                # 3. Risk Gatekeeper Evaluation
+                approved, reason, size = risk_manager.evaluate_order(
+                    coin=coin,
+                    side=action,
+                    price=mid_px,
+                    timestamp_ms=timestamp_ms
+                )
+                
+                if approved:
+                    db.log_system("RISK", f"Order APPROVED for {coin} ({action}). Size: {size}")
                     
-                    if approved:
-                        db.log_system("RISK", f"Order APPROVED for {coin} ({action}). Size: {size}")
+                    # 4. L1 Execution
+                    is_buy = action == "LONG"
+                    reduce_only = action == "FLAT"
+                    
+                    # Set slippage price (0.5% buffer)
+                    exec_price = mid_px * 1.005 if is_buy else mid_px * 0.995
+                    
+                    # Execute trade
+                    hl_client.place_order(
+                        coin=coin,
+                        is_buy=is_buy,
+                        size=size,
+                        price=exec_price,
+                        reduce_only=reduce_only
+                    )
+                else:
+                    # Log risk rejection details
+                    if action != "FLAT":
+                        db.log_system("RISK_REJECT", f"Order REJECTED for {coin} ({action}). Reason: {reason}")
+            
+            # 3. Active Market Making and Grid Trading on Top 2 Coins
+            top_2_coins = [strategy_engine.asset_a, strategy_engine.asset_b]
+            for coin in top_2_coins:
+                if not coin:
+                    continue
+                
+                # Fetch optimal sizes through Risk Manager. Since MM and Grid use limit orders, we use small 
+                # base sizes configured manually or dynamically scaled. Let's use an arbitrary 1.0 lot for base.
+                base_size = 1.0 if coin != "BTC" else 0.01 
+                
+                # Execute Market Making
+                mm_signals = strategy_engine.calculate_market_making_signals(coin)
+                asyncio.create_task(execution_algos.execute_market_making(coin, mm_signals, base_size))
+                
+                # Execute Grid Trading
+                grid_signals = strategy_engine.calculate_grid_signals(coin)
+                asyncio.create_task(execution_algos.execute_grid_trading(coin, grid_signals, base_size))
                         
-                        # 4. L1 Execution
-                        is_buy = action == "LONG"
-                        reduce_only = action == "FLAT"
-                        
-                        # Set slippage price (0.5% buffer)
-                        exec_price = mid_px * 1.005 if is_buy else mid_px * 0.995
-                        
-                        # Execute trade
-                        hl_client.place_order(
-                            coin=coin,
-                            is_buy=is_buy,
-                            size=size,
-                            price=exec_price,
-                            reduce_only=reduce_only
-                        )
-                    else:
-                        # Log risk rejection details
-                        if action != "FLAT":
-                            db.log_system("RISK_REJECT", f"Order REJECTED for {coin} ({action}). Reason: {reason}")
-                            
-            # 3. Run cyclical Funding Arbitrage evaluations
+            # 4. Run cyclical Funding Arbitrage evaluations
             funding_arb_agent.run_arbitrage_checks()
             
             # Sleep for 5 seconds between strategy iterations
@@ -206,9 +255,9 @@ def get_root():
 @app.get("/api/dashboard")
 def get_dashboard_metrics():
     """Aggregates active metrics for NextJS Dashboard."""
-    # Fetch real-time balances and positions
+    # Fetch real-time balances and positions (single API call)
     user_state = hl_client.get_user_state()
-    positions = hl_client.get_positions()
+    positions = hl_client.get_positions(user_state=user_state)  # Reuse user_state to avoid redundant call
     
     # Get latest zscores
     latest_zscores = db.get_latest_zscores(limit=30)
@@ -219,27 +268,40 @@ def get_dashboard_metrics():
     # Get latest news sentiment logs
     sentiment_logs = db.get_latest_sentiment(limit=5)
     
-    # Current active market prices
-    btc_price = tracker.get_market_state("BTC").get("mid", 75500.0)
-    eth_price = tracker.get_market_state("ETH").get("mid", 2070.0)
-    doge_price = tracker.get_market_state("DOGE").get("mid", 0.17)
-    sui_price = tracker.get_market_state("SUI").get("mid", 3.50)
+    # Current active market prices with live/mock status
+    btc_state = tracker.get_market_state("BTC")
+    eth_state = tracker.get_market_state("ETH")
+    doge_state = tracker.get_market_state("DOGE")
+    sui_state = tracker.get_market_state("SUI")
+    
+    btc_price = btc_state.get("mid", 75500.0)
+    eth_price = eth_state.get("mid", 2070.0)
+    doge_price = doge_state.get("mid", 0.17)
+    sui_price = sui_state.get("mid", 3.50)
+    
+    # Determine if market feeds are live (from real WebSocket) or mock fallback
+    markets_live = not btc_state.get("is_mock", False)
     
     margin_summary = {}
+    is_mock = True
     if user_state and "marginSummary" in user_state:
         margin_summary = user_state["marginSummary"]
+        is_mock = user_state.get("is_mock", False)
+    elif user_state is None:
+        is_mock = True
         
     return {
         "bot_running": BOT_STATUS["is_running"] and not risk_manager.is_halted,
         "is_halted": risk_manager.is_halted,
-        "account_value": margin_summary.get("accountValue", "7.42"),
-        "total_margin_used": margin_summary.get("totalMarginUsed", "0.0"),
-        "withdrawable": margin_summary.get("withdrawable", "7.42"),
+        "account_value": margin_summary.get("accountValue", "0.00"),
+        "total_margin_used": margin_summary.get("totalMarginUsed", "0.00"),
+        "withdrawable": margin_summary.get("withdrawable", "0.00"),
         "positions": positions,
         "btc_price": btc_price,
         "eth_price": eth_price,
         "doge_price": doge_price,
         "sui_price": sui_price,
+        "markets_live": markets_live,
         "asset_a": strategy_engine.asset_a,
         "asset_b": strategy_engine.asset_b,
         "current_zscore": strategy_engine.current_zscore,
@@ -248,7 +310,7 @@ def get_dashboard_metrics():
         "zscore_history": latest_zscores[::-1], # Return chronological
         "recent_trades": recent_trades,
         "sentiment_logs": sentiment_logs,
-        "is_mock": user_state.get("is_mock", False) if user_state else True
+        "is_mock": is_mock
     }
 
 @app.get("/api/logs")
@@ -319,7 +381,8 @@ def run_historical_backtest(request: BacktestRequest):
     results = backtester.run_backtest(
         df_data,
         entry_z=request.entry_threshold,
-        exit_z=request.exit_threshold
+        exit_z=request.exit_threshold,
+        window=request.window_size
     )
     return results
 

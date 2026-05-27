@@ -108,4 +108,140 @@ class ExecutionAlgos:
                 
         db.log_system("EXECUTION_ALGO", f"Iceberg order completed successfully for {coin}.")
 
+    async def execute_market_making(self, coin: str, signals: dict, size: float):
+        """
+        Actively manages resting Market Maker limit orders dynamically.
+        """
+        if not signals:
+            return
+            
+        if not hasattr(self, 'active_mm_orders'):
+            self.active_mm_orders = {}
+            
+        if coin not in self.active_mm_orders:
+            self.active_mm_orders[coin] = {"bid_oid": None, "ask_oid": None}
+            
+        # 1. Circuit Breaker Check
+        if signals.get("adverse_selection_halt", False):
+            db.log_system("EXECUTION_MM", f"Adverse Selection Halted on {coin}. Cancelling all resting MM orders.")
+            if self.active_mm_orders[coin]["bid_oid"]:
+                hl_client.cancel_order(coin, self.active_mm_orders[coin]["bid_oid"])
+                self.active_mm_orders[coin]["bid_oid"] = None
+            if self.active_mm_orders[coin]["ask_oid"]:
+                hl_client.cancel_order(coin, self.active_mm_orders[coin]["ask_oid"])
+                self.active_mm_orders[coin]["ask_oid"] = None
+            return
+
+        optimal_bid = signals.get("bid_price", 0.0)
+        optimal_ask = signals.get("ask_price", 0.0)
+        
+        if optimal_bid == 0.0 or optimal_ask == 0.0:
+            return
+
+        open_orders = hl_client.get_open_orders(coin)
+        open_oids = [o.get("oid") for o in open_orders]
+        
+        # 2. Check and manage Bid
+        current_bid_oid = self.active_mm_orders[coin]["bid_oid"]
+        needs_new_bid = True
+        
+        if current_bid_oid and current_bid_oid in open_oids:
+            # Find the order
+            order_data = next((o for o in open_orders if o.get("oid") == current_bid_oid), None)
+            if order_data:
+                current_price = float(order_data.get("limitPx", 0.0))
+                drift = abs(current_price - optimal_bid) / optimal_bid
+                if drift < 0.0005: # 0.05% drift tolerance
+                    needs_new_bid = False
+                else:
+                    hl_client.cancel_order(coin, current_bid_oid)
+                    
+        if needs_new_bid:
+            res = hl_client.place_order(coin, is_buy=True, size=size, price=optimal_bid)
+            if res.get("status") == "ok":
+                # Extract OID from response if available
+                new_oid = res.get("response", {}).get("data", {}).get("statuses", [{}])[0].get("resting", {}).get("oid")
+                if not new_oid: # fallback for mock
+                    new_oid = res.get("response", {}).get("id")
+                self.active_mm_orders[coin]["bid_oid"] = new_oid
+
+        # 3. Check and manage Ask
+        current_ask_oid = self.active_mm_orders[coin]["ask_oid"]
+        needs_new_ask = True
+        
+        if current_ask_oid and current_ask_oid in open_oids:
+            order_data = next((o for o in open_orders if o.get("oid") == current_ask_oid), None)
+            if order_data:
+                current_price = float(order_data.get("limitPx", 0.0))
+                drift = abs(current_price - optimal_ask) / optimal_ask
+                if drift < 0.0005:
+                    needs_new_ask = False
+                else:
+                    hl_client.cancel_order(coin, current_ask_oid)
+                    
+        if needs_new_ask:
+            res = hl_client.place_order(coin, is_buy=False, size=size, price=optimal_ask)
+            if res.get("status") == "ok":
+                new_oid = res.get("response", {}).get("data", {}).get("statuses", [{}])[0].get("resting", {}).get("oid")
+                if not new_oid:
+                    new_oid = res.get("response", {}).get("id")
+                self.active_mm_orders[coin]["ask_oid"] = new_oid
+
+    async def execute_grid_trading(self, coin: str, signals: dict, base_size: float):
+        """
+        Actively manages a live Grid Trading Limit array.
+        """
+        buy_levels = signals.get("buy_levels", [])
+        sell_levels = signals.get("sell_levels", [])
+        
+        if not buy_levels or not sell_levels:
+            return
+            
+        if not hasattr(self, 'active_grid_orders'):
+            self.active_grid_orders = {}
+            
+        if coin not in self.active_grid_orders:
+            self.active_grid_orders[coin] = []
+            
+        # Fetch current open orders
+        open_orders = hl_client.get_open_orders(coin)
+        open_oids = [o.get("oid") for o in open_orders]
+        
+        # Verify grid integrity
+        active_grid_oids = [oid for oid in self.active_grid_orders[coin] if oid in open_oids]
+        
+        # If the number of active grid orders drops (meaning a level filled), or it's empty
+        # We replace the entire grid around the new price for simplicity in this V1 execution engine.
+        total_grid_size = len(buy_levels) + len(sell_levels)
+        
+        if len(active_grid_oids) < total_grid_size:
+            db.log_system("EXECUTION_GRID", f"Grid integrity breached for {coin} (fills detected). Resetting Grid array.")
+            
+            # Cancel remaining old grid orders
+            for oid in active_grid_oids:
+                hl_client.cancel_order(coin, oid)
+                
+            self.active_grid_orders[coin] = []
+            
+            # Place new grid
+            for level in buy_levels:
+                size = base_size * level["size"]
+                res = hl_client.place_order(coin, is_buy=True, size=size, price=level["price"])
+                if res.get("status") == "ok":
+                    new_oid = res.get("response", {}).get("data", {}).get("statuses", [{}])[0].get("resting", {}).get("oid")
+                    if new_oid:
+                        self.active_grid_orders[coin].append(new_oid)
+                    elif res.get("response", {}).get("id"):
+                        self.active_grid_orders[coin].append(res.get("response", {}).get("id"))
+                        
+            for level in sell_levels:
+                size = base_size * level["size"]
+                res = hl_client.place_order(coin, is_buy=False, size=size, price=level["price"])
+                if res.get("status") == "ok":
+                    new_oid = res.get("response", {}).get("data", {}).get("statuses", [{}])[0].get("resting", {}).get("oid")
+                    if new_oid:
+                        self.active_grid_orders[coin].append(new_oid)
+                    elif res.get("response", {}).get("id"):
+                        self.active_grid_orders[coin].append(res.get("response", {}).get("id"))
+
 execution_algos = ExecutionAlgos()

@@ -5,20 +5,69 @@ from backend.services.hyperliquid_client import hl_client
 class FundingArbitrageAgent:
     def __init__(self):
         self.is_active = False
-        
-        # State: tracks simulated or real APY metrics for visual dashboard display
-        self.arbitrage_opportunities = [
-            {"coin": "BTC", "funding_rate_8h": 0.00045, "annualized_apy": 15.93, "status": "Stable"},
-            {"coin": "ETH", "funding_rate_8h": 0.00052, "annualized_apy": 18.61, "status": "High Yield"},
-            {"coin": "SOL", "funding_rate_8h": 0.00095, "annualized_apy": 36.42, "status": "Extreme Volatility"}
-        ]
+        self.arbitrage_opportunities = []
+        self._last_update_time = 0.0
 
     def get_opportunities(self):
-        """Fetch funding opportunities across active markets."""
-        # In a real environment, we call hl_client.info.meta() or funding statistics.
-        # We return the calculated APY structures:
-        # APY = (1 + FundingRate8H)^1095 - 1 (or simple APR = FundingRate8H * 3 * 365)
-        return self.arbitrage_opportunities
+        """Fetch real funding opportunities across active markets."""
+        import time
+        now = time.time()
+        
+        # Cache for 60 seconds to avoid API spam
+        if now - self._last_update_time < 60.0 and self.arbitrage_opportunities:
+            return self.arbitrage_opportunities
+            
+        if not hl_client.is_active or hl_client.info is None:
+            # Fallback if offline
+            return [
+                {"coin": "BTC", "funding_rate_8h": 0.00045, "annualized_apy": 15.93, "status": "Simulated"},
+                {"coin": "ETH", "funding_rate_8h": 0.00052, "annualized_apy": 18.61, "status": "Simulated"}
+            ]
+            
+        try:
+            # hl_client.info.meta_and_asset_ctxs() returns [meta, ctxs]
+            meta_and_ctxs = hl_client.info.meta_and_asset_ctxs()
+            universe = meta_and_ctxs[0].get("universe", [])
+            ctxs = meta_and_ctxs[1]
+            
+            opportunities = []
+            
+            for i, asset_meta in enumerate(universe):
+                asset_name = asset_meta.get("name")
+                if i < len(ctxs):
+                    ctx = ctxs[i]
+                    funding_str = ctx.get("funding")
+                    if funding_str:
+                        funding_rate = float(funding_str)
+                        # Hyperliquid funding is typically hourly. Let's assume hourly rate.
+                        # Annualized APY simple calculation: funding_rate * 24 * 365 * 100
+                        annualized_apy = funding_rate * 24 * 365 * 100
+                        
+                        if annualized_apy > 0:
+                            status = "Stable"
+                            if annualized_apy > 50:
+                                status = "Extreme Volatility"
+                            elif annualized_apy > 20:
+                                status = "High Yield"
+                                
+                            opportunities.append({
+                                "coin": asset_name,
+                                "funding_rate_1h": funding_rate,
+                                "annualized_apy": round(annualized_apy, 2),
+                                "status": status
+                            })
+                            
+            # Sort by highest APY descending
+            opportunities.sort(key=lambda x: x["annualized_apy"], reverse=True)
+            
+            # Keep top 10
+            self.arbitrage_opportunities = opportunities[:10]
+            self._last_update_time = now
+            return self.arbitrage_opportunities
+            
+        except Exception as e:
+            db.log_system("ERROR", f"Failed to fetch real funding rates: {str(e)}")
+            return self.arbitrage_opportunities
 
     def toggle_agent(self, status: bool) -> bool:
         self.is_active = status
@@ -30,12 +79,52 @@ class FundingArbitrageAgent:
         if not self.is_active:
             return
             
-        # Delta-Neutral check logic:
-        # If SOL perpetual funding rate is extremely high and we have enough capital:
-        # 1. Buy SOL spot
-        # 2. Short SOL perpetual
-        # 3. Pocket funding fees.
-        # Log simulated activity for developers
-        db.log_system("FUNDING_ARB", "Cash-and-Carry Agent scanning funding spreads... All delta-neutral bounds currently protected.")
+        import time
+        now = time.time()
+        
+        # Only run check every 5 minutes to avoid spam
+        if not hasattr(self, '_last_check') or now - self._last_check > 300:
+            self._last_check = now
+            
+            opportunities = self.get_opportunities()
+            if opportunities:
+                top_opp = opportunities[0]
+                coin = top_opp["coin"]
+                apy = top_opp["annualized_apy"]
+                
+                db.log_system("FUNDING_ARB", f"Scanning funding spreads... Top opportunity: {coin} at {apy}% APY")
+                
+                if apy > 30.0:  # Threshold to execute
+                    # Execute Delta-Neutral trade (Simulate Spot, Real Perp Short)
+                    db.log_system("FUNDING_ARB", f"Executing Delta-Neutral Cash & Carry for {coin}. Buying Spot (Simulated), Shorting Perp (Live).")
+                    
+                    # Fetch current price
+                    from backend.services.orderbook_tracker import tracker
+                    market_state = tracker.get_market_state(coin)
+                    mid_px = market_state.get("mid", 0.0)
+                    
+                    if mid_px > 0:
+                        # Risk Gatekeeper Evaluation
+                        from backend.services.risk_manager import risk_manager
+                        timestamp_ms = int(time.time() * 1000)
+                        approved, reason, size = risk_manager.evaluate_order(
+                            coin=coin,
+                            side="SHORT",
+                            price=mid_px,
+                            timestamp_ms=timestamp_ms
+                        )
+                        
+                        if approved:
+                            # Set slippage price
+                            exec_price = mid_px * 0.995
+                            hl_client.place_order(
+                                coin=coin,
+                                is_buy=False,
+                                size=size,
+                                price=exec_price,
+                                reduce_only=False
+                            )
+                        else:
+                            db.log_system("FUNDING_ARB", f"Arbitrage rejected by Risk Manager: {reason}")
 
 funding_arb_agent = FundingArbitrageAgent()

@@ -62,9 +62,11 @@ class HyperliquidClient:
             db.log_system("ERROR", f"Error fetching user state: {str(e)}")
             return None
 
-    def get_positions(self):
-        """Fetch currently active perpetual positions."""
-        state = self.get_user_state()
+    def get_positions(self, user_state=None):
+        """Fetch currently active perpetual positions.
+        Accepts optional pre-fetched user_state to avoid redundant API calls.
+        """
+        state = user_state if user_state is not None else self.get_user_state()
         if not state:
             return []
         
@@ -151,6 +153,37 @@ class HyperliquidClient:
             db.log_system("ERROR", f"Failed to place order on Hyperliquid: {str(e)}")
             db.log_system("DEBUG", traceback.format_exc())
             return {"status": "error", "message": str(e)}
+
+    def get_open_orders(self, coin: str = None):
+        """Fetch active resting limit orders."""
+        if not self.is_active:
+            return []
+            
+        try:
+            target_user = Config.ACCOUNT_ADDRESS if Config.ACCOUNT_ADDRESS else self.wallet_address
+            open_orders = self.info.open_orders(target_user)
+            
+            if coin:
+                return [o for o in open_orders if o.get("coin") == coin]
+            return open_orders
+        except Exception as e:
+            db.log_system("ERROR", f"Error fetching open orders: {str(e)}")
+            return []
+
+    def cancel_order(self, coin: str, oid: int):
+        """Cancel a specific resting limit order."""
+        if not self.is_active:
+            db.log_system("SIMULATION", f"MOCK CANCEL ORDER: {coin} | OID: {oid}")
+            return True
+            
+        try:
+            db.log_system("EXECUTION", f"Cancelling L1 Order: {coin} | OID: {oid}")
+            cancel_result = self.exchange.cancel(coin, oid)
+            db.log_system("INFO", f"Cancel order response: {cancel_result}")
+            return True
+        except Exception as e:
+            db.log_system("ERROR", f"Error cancelling order {oid} for {coin}: {str(e)}")
+            return False
 
     def cancel_all_orders(self):
         """Emergency Kill Switch - cancels all open orders."""

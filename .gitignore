@@ -15,3 +15,6 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .coverage
+node_modules/
+dist/
+.next/

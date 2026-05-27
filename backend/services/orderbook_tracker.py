@@ -37,6 +37,23 @@ class OrderBookTracker:
         if self._loop:
             self._loop.call_soon_threadsafe(self._loop.stop)
 
+    def update_target_coins(self, new_coins_list):
+        """Dynamically updates the active subscription universe."""
+        with self._lock:
+            # Add missing
+            for coin in new_coins_list:
+                if coin not in self.coins:
+                    self.coins.append(coin)
+                    self.books[coin] = {"bids": {}, "asks": {}, "mid": 0.0, "spread": 0.0, "imbalance": 0.0}
+                    if hasattr(self, '_active_ws') and self._active_ws and self._loop:
+                        # Schedule subscription in async loop
+                        msg = json.dumps({"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}})
+                        asyncio.run_coroutine_threadsafe(self._active_ws.send(msg), self._loop)
+                        db.log_system("WS", f"Dynamically subscribed to l2Book for {coin}")
+            
+            # Note: We keep old coins in self.books memory so StrategyEngine doesn't crash if it iterates late, 
+            # but we don't strictly unsubscribe to keep it simple, or we can just stop tracking them in updates.
+
     def _run_thread(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
@@ -48,10 +65,14 @@ class OrderBookTracker:
             try:
                 db.log_system("WS", f"Connecting to WebSocket: {self.ws_url}")
                 async with websockets.connect(self.ws_url) as ws:
+                    self._active_ws = ws
                     backoff = 1 # Reset backoff upon successful connection
                     
                     # Send subscriptions
-                    for coin in self.coins:
+                    with self._lock:
+                        coins_to_sub = self.coins.copy()
+                    
+                    for coin in coins_to_sub:
                         subscribe_msg = {
                             "method": "subscribe",
                             "subscription": {"type": "l2Book", "coin": coin}

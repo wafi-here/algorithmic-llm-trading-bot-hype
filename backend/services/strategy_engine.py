@@ -51,43 +51,39 @@ class StrategyEngine:
         self.latest_sentiment = score
         db.log_system("STRATEGY", f"Updated strategy sentiment score to: {score:.2f}")
 
+    def sync_with_universe(self, active_universe):
+        """Reassigns pairs based on the dynamically provided liquidity universe."""
+        if not active_universe or len(active_universe) < 2:
+            return
+            
+        # Pair top 1 and top 2 as the primary pair
+        new_a = active_universe[0]
+        new_b = active_universe[1]
+        
+        if self.asset_a != new_a or self.asset_b != new_b:
+            self.asset_a = new_a
+            self.asset_b = new_b
+            db.log_system("STRATEGY", f"Dynamic Universe Sync: Active primary pair switched to {new_a}/{new_b}")
+            
+        # Pair up the rest if possible
+        new_pairs = []
+        for i in range(0, len(active_universe) - 1, 2):
+            new_pairs.append({
+                "asset_a": active_universe[i],
+                "asset_b": active_universe[i+1],
+                "hedge_ratio": 1.0 # Fallback 1:1 since we don't have historical cointegration model
+            })
+        self.pairs = new_pairs
+
     def calculate_signals(self):
         """
         Runs mathematical Z-score analysis on latest orderbook ticks.
         Integrates LLM sentiment to skew entry thresholds.
         Returns: A dictionary containing signals: { "BTC": "LONG"|"SHORT"|"FLAT"|None, "ETH": ... }
         """
-        # Determine the active pair dynamically based on account balance
-        # If balance >= $5.00, trade BTC/ETH. Otherwise fallback to DOGE/SUI.
-        # Bypass this dynamic adjustment if running in pytest/unittest for deterministic mock test asserts.
         import sys
         is_testing = "pytest" in sys.modules or "unittest" in sys.modules
         
-        if not is_testing:
-            from backend.services.hyperliquid_client import hl_client
-            user_state = hl_client.get_user_state()
-            account_value = 7.42 # Fallback
-            if user_state and "marginSummary" in user_state:
-                account_val_str = user_state["marginSummary"].get("accountValue", "7.42")
-                try:
-                    account_value = float(account_val_str)
-                except ValueError:
-                    account_value = 7.42
-                
-            # Dynamically set active assets
-            if account_value >= 5.00:
-                if self.asset_a != "BTC" or self.asset_b != "ETH":
-                    self.asset_a = "BTC"
-                    self.asset_b = "ETH"
-                    self.hedge_ratio = 19.0
-                    db.log_system("STRATEGY", "DYNAMIC SIZING: Account balance supports BTC/ETH trading. Switched active pair to BTC/ETH.")
-            else:
-                if self.asset_a != "DOGE" or self.asset_b != "SUI":
-                    self.asset_a = "DOGE"
-                    self.asset_b = "SUI"
-                    self.hedge_ratio = 0.099
-                    db.log_system("STRATEGY", "DYNAMIC SIZING: Account balance is low. Switched active pair to fallback DOGE/SUI.")
-                
         # Update spread buffers for ALL pairs to keep them hot and populated
         for pair in self.pairs:
             a = pair["asset_a"]
