@@ -32,3 +32,5 @@ class Config:
     RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", 0.01)) # Risk 1% equity per trade
     CIRCUIT_BREAKER_LATENCY_MS = int(os.getenv("CIRCUIT_BREAKER_LATENCY_MS", 100)) # Sinyal stale after 100ms
     DAILY_DRAWDOWN_LIMIT_PCT = float(os.getenv("DAILY_DRAWDOWN_LIMIT_PCT", 0.05)) # Stop trading if -5% daily
+    BOT_CYCLE_INTERVAL_SECONDS = int(os.getenv("BOT_CYCLE_INTERVAL_SECONDS", 30))
+

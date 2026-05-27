@@ -1,4 +1,5 @@
 import pytest
+import time
 import numpy as np
 from collections import deque
 import os
@@ -57,26 +58,40 @@ def test_zscore_skewing_by_sentiment():
     engine.update_sentiment(-0.8)
     assert engine.latest_sentiment == -0.8
 
-def test_risk_manager_circuit_breakers():
+@pytest.mark.asyncio
+async def test_risk_manager_circuit_breakers():
     """Verify Risk Manager enforces drawdowns, stale signals, and limits correctly."""
+    from unittest.mock import AsyncMock, patch
     manager = RiskManager()
+    manager.last_sync_time = time.time()
     
-    # Test 1: Halted bot rejects orders
-    manager.is_halted = True
-    approved, reason, size = manager.evaluate_order("BTC", "LONG", 67000.0, 1000)
-    assert approved is False
-    assert "HALTED" in reason
+    mock_user_state = {
+        "crossMarginSummary": {"accountValue": "10000.0", "totalMarginUsed": "0.0"},
+        "marginSummary": {"accountValue": "10000.0", "totalMarginUsed": "0.0"},
+        "assetPositions": [],
+    }
     
-    # Test 2: Release halt
-    manager.reset_halt()
-    assert manager.is_halted is False
-    
-    # Test 3: Stale signal latency rejection
-    # If the signal timestamp is very old compared to current time, it must reject
-    stale_time_ms = 1000 # 1970
-    approved, reason, size = manager.evaluate_order("BTC", "LONG", 67000.0, stale_time_ms)
-    assert approved is False
-    assert "rejected" in reason or "Stale" in reason
+    with patch("backend.services.risk_manager.hl_client") as mock_hl:
+        mock_hl.get_user_state = AsyncMock(return_value=mock_user_state)
+        mock_hl.is_active = True
+        mock_hl.cancel_all_orders = AsyncMock(return_value=True)
+        
+        # Test 1: Halted bot rejects orders
+        manager.is_halted = True
+        approved, reason, size = await manager.evaluate_order("BTC", "LONG", 67000.0, 1000)
+        assert approved is False
+        assert "HALTED" in reason
+        
+        # Test 2: Release halt
+        manager.reset_halt()
+        assert manager.is_halted is False
+        
+        # Test 3: Stale signal latency rejection
+        # If the signal timestamp is very old compared to current time, it must reject
+        stale_time_ms = 1000 # 1970
+        approved, reason, size = await manager.evaluate_order("BTC", "LONG", 67000.0, stale_time_ms)
+        assert approved is False
+        assert "rejected" in reason or "Stale" in reason
 
 def test_historical_backtester_logic():
     """Verify that historical backtester accurately runs simulation and calculates PnL/metrics."""
@@ -101,7 +116,8 @@ async def test_telegram_alerts_sim_fallback():
     success = await alert_broker.send_alert("Test Alert message")
     assert success is True
 
-def test_funding_rate_arbitrage_agent():
+@pytest.mark.asyncio
+async def test_funding_rate_arbitrage_agent():
     """Verify that Funding Arbitrage Agent toggles correctly and returns APY structures."""
     from backend.services.funding_arbitrage import funding_arb_agent
     assert funding_arb_agent.is_active is False
@@ -109,7 +125,7 @@ def test_funding_rate_arbitrage_agent():
     assert funding_arb_agent.is_active is True
     funding_arb_agent.toggle_agent(False)
     
-    opportunities = funding_arb_agent.get_opportunities()
+    opportunities = await funding_arb_agent.get_opportunities()
     assert len(opportunities) > 0  # Should be up to 10 live opportunities
     assert "annualized_apy" in opportunities[0]
 

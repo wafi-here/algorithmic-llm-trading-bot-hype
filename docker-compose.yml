@@ -12,6 +12,7 @@ services:
       - "8000:8000"
     volumes:
       - ./backend:/app/backend
+      - /app/backend/__pycache__
       - sqlite_data:/app
     environment:
       - PORT=8000

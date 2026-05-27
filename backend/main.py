@@ -29,6 +29,12 @@ BOT_STATUS = {
 
 background_tasks = set()
 
+def create_background_task(coro):
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return task
+
 async def trading_bot_loop():
     """Main trading bot execution loop running asynchronously in the background."""
     db.log_system("SYSTEM", "Starting main trading bot evaluation loop...")
@@ -43,7 +49,7 @@ async def trading_bot_loop():
         
     # Initial Universe Scan
     try:
-        top_coins = universe_manager.update_universe(max_coins=10)
+        top_coins = await universe_manager.update_universe(max_coins=10)
         tracker.update_target_coins(top_coins)
         strategy_engine.sync_with_universe(top_coins)
     except Exception as e:
@@ -62,7 +68,7 @@ async def trading_bot_loop():
             # 1. Scrape news every 10 minutes (600 seconds)
             if now - last_sentiment_scrape > 600:
                 # Trigger in background so it doesn't block fast tick execution
-                asyncio.create_task(update_sentiment_async())
+                create_background_task(update_sentiment_async())
                 last_sentiment_scrape = now
 
             # 2. Prune database logs every hour (3600 seconds) to ensure storage efficiency
@@ -72,7 +78,7 @@ async def trading_bot_loop():
 
             # 3. Dynamic Universe Rescan every hour (3600 seconds)
             if now - last_universe_scan > 3600:
-                top_coins = universe_manager.update_universe(max_coins=10)
+                top_coins = await universe_manager.update_universe(max_coins=10)
                 tracker.update_target_coins(top_coins)
                 strategy_engine.sync_with_universe(top_coins)
                 last_universe_scan = now
@@ -83,28 +89,83 @@ async def trading_bot_loop():
             strat_result = strategy_engine.calculate_signals()
             
             # Generate consensus signals from multiple strategies
-            final_signals = {}
+            zscore_signals = {}
             if strat_result and "signals" in strat_result:
-                final_signals = strat_result["signals"]
-                
-            # Evaluate Diagnostic Strategies for live execution
-            # If Momentum and Volatility Breakout agree on a trend, we allow execution
-            for coin in [strategy_engine.asset_a, strategy_engine.asset_b]:
+                zscore_signals = strat_result["signals"]
+            
+            # Build a ranked signal list from ALL coins in the active universe
+            # Each entry: {"coin": str, "action": str, "strength": int, "sources": [str]}
+            # strength: 3 = Z-Score + Momentum + Breakout, 2 = Momentum + Breakout consensus, 1 = Z-Score only
+            ranked_signals = []
+            
+            # Collect coins to evaluate: primary pair + all universe coins
+            coins_to_evaluate = set()
+            coins_to_evaluate.add(strategy_engine.asset_a)
+            coins_to_evaluate.add(strategy_engine.asset_b)
+            for coin in universe_manager.get_active_universe():
+                coins_to_evaluate.add(coin)
+            coins_to_evaluate.discard(None)
+            
+            for coin in coins_to_evaluate:
                 mom_sig = strategy_engine.calculate_momentum_signals(coin)
                 brk_sig = strategy_engine.calculate_volatility_breakout(coin)
+                zs_sig = zscore_signals.get(coin)
                 
-                # Consensus Check: Both indicate LONG or SHORT
-                if mom_sig and brk_sig and mom_sig == brk_sig and mom_sig != "FLAT":
+                # Determine the best action and its strength for this coin
+                action = None
+                strength = 0
+                sources = []
+                
+                # Priority 1: Full Triple Consensus (Z-Score + Momentum + Breakout)
+                if zs_sig and mom_sig and brk_sig and zs_sig == mom_sig == brk_sig and zs_sig != "FLAT":
+                    action = zs_sig
+                    strength = 3
+                    sources = ["Z-Score", "Momentum", "Breakout"]
+                
+                # Priority 2: Z-Score signal confirmed by at least one trend indicator
+                elif zs_sig and zs_sig != "FLAT" and (mom_sig == zs_sig or brk_sig == zs_sig):
+                    action = zs_sig
+                    strength = 2
+                    confirmer = "Momentum" if mom_sig == zs_sig else "Breakout"
+                    sources = ["Z-Score", confirmer]
+                
+                # Priority 3: Strong Consensus from Momentum + Breakout (no Z-Score)
+                elif mom_sig and brk_sig and mom_sig == brk_sig and mom_sig != "FLAT":
+                    action = mom_sig
+                    strength = 2
+                    sources = ["Momentum", "Breakout"]
                     db.log_system("STRATEGY_CONSENSUS", f"Strong {mom_sig} consensus from Momentum + Breakout on {coin}")
-                    # Prioritize Z-Score (Statistical Arbitrage) if it already fired, otherwise use consensus
-                    if coin not in final_signals or final_signals[coin] is None:
-                        final_signals[coin] = mom_sig
                 
-            # Process final signals
-            for coin, action in final_signals.items():
-                if not action:
-                    continue
-                    
+                # Priority 4: Z-Score FLAT signal (for exit/take-profit)
+                elif zs_sig == "FLAT":
+                    action = "FLAT"
+                    strength = 1
+                    sources = ["Z-Score"]
+                
+                if action:
+                    ranked_signals.append({
+                        "coin": coin,
+                        "action": action,
+                        "strength": strength,
+                        "sources": sources
+                    })
+            
+            # Sort by strength descending (strongest signals first)
+            ranked_signals.sort(key=lambda x: x["strength"], reverse=True)
+            
+            # Process ranked signals with margin pre-check
+            executed_any = False
+            margin_failures = 0
+            
+            # Pre-fetch positions once (not per-coin) to avoid API spam
+            active_positions = await hl_client.get_positions()
+            
+            for signal in ranked_signals:
+                coin = signal["coin"]
+                action = signal["action"]
+                strength = signal["strength"]
+                sources = signal["sources"]
+                
                 # Fetch latest market state for pricing
                 market_state = tracker.get_market_state(coin)
                 mid_px = market_state.get("mid", 0.0)
@@ -115,7 +176,6 @@ async def trading_bot_loop():
                 timestamp_ms = int(time.time() * 1000)
                 
                 # Evaluate side vs current active positions to prevent double entries
-                active_positions = hl_client.get_positions()
                 has_position = any(p["coin"] == coin for p in active_positions)
                 
                 # Prevent entering identical position twice
@@ -126,8 +186,18 @@ async def trading_bot_loop():
                 if action == "FLAT" and not has_position:
                     continue
 
-                # 3. Risk Gatekeeper Evaluation
-                approved, reason, size = risk_manager.evaluate_order(
+                # Quick margin feasibility pre-check for entry orders (skip for exits)
+                if action != "FLAT":
+                    feasible, feasibility_reason = await risk_manager.check_margin_feasibility(coin, mid_px)
+                    if not feasible:
+                        margin_failures += 1
+                        # Only log margin skip once every 5 cycles to avoid log spam
+                        if BOT_STATUS["cycles_executed"] % 5 == 1:
+                            db.log_system("MARGIN_SKIP", f"Pre-check skip {coin} ({action}, str={strength}): {feasibility_reason}")
+                        continue
+
+                # Full Risk Gatekeeper Evaluation
+                approved, reason, size = await risk_manager.evaluate_order(
                     coin=coin,
                     side=action,
                     price=mid_px,
@@ -135,9 +205,9 @@ async def trading_bot_loop():
                 )
                 
                 if approved:
-                    db.log_system("RISK", f"Order APPROVED for {coin} ({action}). Size: {size}")
+                    db.log_system("RISK", f"Order APPROVED for {coin} ({action}). Size: {size} | Signal: {'+'.join(sources)} (str={strength})")
                     
-                    # 4. L1 Execution
+                    # L1 Execution
                     is_buy = action == "LONG"
                     reduce_only = action == "FLAT"
                     
@@ -145,48 +215,80 @@ async def trading_bot_loop():
                     exec_price = mid_px * 1.005 if is_buy else mid_px * 0.995
                     
                     # Execute trade
-                    hl_client.place_order(
+                    await hl_client.place_order(
                         coin=coin,
                         is_buy=is_buy,
                         size=size,
                         price=exec_price,
                         reduce_only=reduce_only
                     )
+                    executed_any = True
                 else:
                     # Log risk rejection details
                     if action != "FLAT":
                         db.log_system("RISK_REJECT", f"Order REJECTED for {coin} ({action}). Reason: {reason}")
             
-            # 3. Active Market Making and Grid Trading on Top 2 Coins
-            top_2_coins = [strategy_engine.asset_a, strategy_engine.asset_b]
-            for coin in top_2_coins:
-                if not coin:
-                    continue
-                
-                # Fetch optimal sizes through Risk Manager. Since MM and Grid use limit orders, we use small 
-                # base sizes configured manually or dynamically scaled. Let's use an arbitrary 1.0 lot for base.
-                base_size = 1.0 if coin != "BTC" else 0.01 
-                
-                # Execute Market Making
-                mm_signals = strategy_engine.calculate_market_making_signals(coin)
-                asyncio.create_task(execution_algos.execute_market_making(coin, mm_signals, base_size))
-                
-                # Execute Grid Trading
-                grid_signals = strategy_engine.calculate_grid_signals(coin)
-                asyncio.create_task(execution_algos.execute_grid_trading(coin, grid_signals, base_size))
+            # Log summary if all entry signals failed margin check
+            if not executed_any and margin_failures > 0 and len(ranked_signals) > 0:
+                entry_signals = [s for s in ranked_signals if s["action"] != "FLAT"]
+                if entry_signals and margin_failures >= len(entry_signals):
+                    if BOT_STATUS["cycles_executed"] % 10 == 1:
+                        db.log_system("MARGIN_EXHAUSTED", 
+                            f"No executable opportunities this cycle. "
+                            f"{margin_failures}/{len(entry_signals)} entry signals failed margin pre-check. "
+                            f"Consider depositing more funds or closing existing positions."
+                        )
+            
+            # 3. Active Market Making and Grid Trading on Top 2 Coins (Bypassed for micro-accounts < $50 to protect request ratio limits)
+            user_state = await hl_client.get_user_state()
+            is_micro = True
+            if user_state:
+                cross_val = float(user_state.get("crossMarginSummary", {}).get("accountValue", 0.0))
+                isolated_val = float(user_state.get("marginSummary", {}).get("accountValue", 0.0))
+                account_val = max(cross_val, isolated_val)
+                if account_val >= 50.0:
+                    is_micro = False
+                elif user_state.get("is_mock", False):
+                    is_micro = False
+
+            if is_micro:
+                if BOT_STATUS["cycles_executed"] % 5 == 1:
+                    db.log_system("SYSTEM", "Skipping High-Frequency Grid & MM for micro-account (< $50) to protect request-to-volume ratio limits.")
+            else:
+                top_2_coins = [strategy_engine.asset_a, strategy_engine.asset_b]
+                for coin in top_2_coins:
+                    if not coin:
+                        continue
+                    
+                    # Fetch optimal sizes through Risk Manager or use dynamic minimum notional.
+                    # Grid and MM layers use slices (e.g. 10%). To satisfy $12 minimum per slice, we set base notional to $120.
+                    state = tracker.get_market_state(coin)
+                    mid_px = state.get("mid", 0.0)
+                    if mid_px > 0:
+                        base_size = 120.0 / mid_px
+                    else:
+                        base_size = 1.0 if coin != "BTC" else 0.001 
+                    
+                    # Execute Market Making
+                    mm_signals = strategy_engine.calculate_market_making_signals(coin)
+                    create_background_task(execution_algos.execute_market_making(coin, mm_signals, base_size))
+                    
+                    # Execute Grid Trading
+                    grid_signals = strategy_engine.calculate_grid_signals(coin)
+                    create_background_task(execution_algos.execute_grid_trading(coin, grid_signals, base_size))
                         
             # 4. Run cyclical Funding Arbitrage evaluations
-            funding_arb_agent.run_arbitrage_checks()
+            await funding_arb_agent.run_arbitrage_checks()
             
-            # Sleep for 5 seconds between strategy iterations
-            await asyncio.sleep(5)
+            # Sleep between strategy iterations
+            await asyncio.sleep(Config.BOT_CYCLE_INTERVAL_SECONDS)
             
         except asyncio.CancelledError:
             db.log_system("SYSTEM", "Trading bot loop task cancelled.")
             break
         except Exception as e:
             db.log_system("ERROR", f"Error in main bot loop: {str(e)}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(Config.BOT_CYCLE_INTERVAL_SECONDS)
 
 async def update_sentiment_async():
     """Helper to run news scraping in background without blocking the loop."""
@@ -208,7 +310,7 @@ async def lifespan(app: FastAPI):
     scanner.start()
     
     # Start the background trading loop task
-    bot_task = asyncio.create_task(trading_bot_loop())
+    bot_task = create_background_task(trading_bot_loop())
     background_tasks.add(bot_task)
     
     yield
@@ -253,11 +355,11 @@ def get_root():
     }
 
 @app.get("/api/dashboard")
-def get_dashboard_metrics():
+async def get_dashboard_metrics():
     """Aggregates active metrics for NextJS Dashboard."""
     # Fetch real-time balances and positions (single API call)
-    user_state = hl_client.get_user_state()
-    positions = hl_client.get_positions(user_state=user_state)  # Reuse user_state to avoid redundant call
+    user_state = await hl_client.get_user_state()
+    positions = await hl_client.get_positions(user_state=user_state)  # Reuse user_state to avoid redundant call
     
     # Get latest zscores
     latest_zscores = db.get_latest_zscores(limit=30)
@@ -284,9 +386,19 @@ def get_dashboard_metrics():
     
     margin_summary = {}
     is_mock = True
-    if user_state and "marginSummary" in user_state:
-        margin_summary = user_state["marginSummary"]
+    if user_state:
         is_mock = user_state.get("is_mock", False)
+        # Use crossMarginSummary if it has a non-zero accountValue, otherwise isolated marginSummary
+        cross_summary = user_state.get("crossMarginSummary", {})
+        isolated_summary = user_state.get("marginSummary", {})
+        
+        cross_val = float(cross_summary.get("accountValue", 0.0))
+        isolated_val = float(isolated_summary.get("accountValue", 0.0))
+        
+        if cross_val > 0 or isolated_val == 0:
+            margin_summary = cross_summary
+        else:
+            margin_summary = isolated_summary
     elif user_state is None:
         is_mock = True
         
@@ -319,10 +431,10 @@ def get_system_logs():
     return db.get_logs(limit=50)
 
 @app.post("/api/emergency-control")
-def handle_emergency_control(request: HaltRequest):
+async def handle_emergency_control(request: HaltRequest):
     """Triggers manual Kill Switch or recovers the system state."""
     if request.action == "HALT":
-        success = risk_manager.trigger_emergency_kill()
+        success = await risk_manager.trigger_emergency_kill()
         if success:
             return {"status": "success", "message": "Bot halt triggered, open orders cancelled!"}
     elif request.action == "RESET":
@@ -361,11 +473,11 @@ def get_scanner_rankings():
     return scanner.get_rankings()
 
 @app.get("/api/funding-arbitrage")
-def get_funding_arbitrage_metrics():
+async def get_funding_arbitrage_metrics():
     """Retrieve Cash-and-Carry funding rate arbitrage metrics."""
     return {
         "agent_active": funding_arb_agent.is_active,
-        "opportunities": funding_arb_agent.get_opportunities()
+        "opportunities": await funding_arb_agent.get_opportunities()
     }
 
 @app.post("/api/funding-arbitrage/toggle")
@@ -424,7 +536,7 @@ class IcebergRequest(BaseModel):
 @app.post("/api/execution/twap")
 async def trigger_twap_execution(request: TwapRequest):
     """Asynchronously triggers the TWAP slicing algorithm."""
-    asyncio.create_task(execution_algos.execute_twap(
+    create_background_task(execution_algos.execute_twap(
         coin=request.coin,
         is_buy=request.is_buy,
         total_size=request.total_size,
@@ -436,7 +548,7 @@ async def trigger_twap_execution(request: TwapRequest):
 @app.post("/api/execution/vwap")
 async def trigger_vwap_execution(request: VwapRequest):
     """Asynchronously triggers the VWAP weighted slicing algorithm."""
-    asyncio.create_task(execution_algos.execute_vwap(
+    create_background_task(execution_algos.execute_vwap(
         coin=request.coin,
         is_buy=request.is_buy,
         total_size=request.total_size,
@@ -448,7 +560,7 @@ async def trigger_vwap_execution(request: VwapRequest):
 @app.post("/api/execution/iceberg")
 async def trigger_iceberg_execution(request: IcebergRequest):
     """Asynchronously triggers the Iceberg fractional slice algorithm."""
-    asyncio.create_task(execution_algos.execute_iceberg(
+    create_background_task(execution_algos.execute_iceberg(
         coin=request.coin,
         is_buy=request.is_buy,
         total_size=request.total_size,

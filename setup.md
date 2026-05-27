@@ -55,17 +55,74 @@ To ensure absolute security of your funds, we enforce Hyperliquid's **Agent Wall
 
 ---
 
-## 🐳 WSL2 & Docker Container Orchestration
+## 🐳 Docker Container Operations & Guide
 
-Both backend and frontend services are completely containerized. The `docker-compose.yml` mounts a local persistent volume for SQLite history.
+This section covers everything you need to know about managing the bot using Docker Compose.
 
-### 1. File Volume Layout
+### 1. File Volume Layout & Networking
 - **`trading_bot.db`**: Local SQLite database storing Z-score logs, scraped news sentiment values, executed trades, and backend system logs. Wiped containers do *not* lose this data as it resides in the Docker persistent volume storage.
-- **Note on Connections**: The backend utilizes thread-local `threading.local()` connection pooling to prevent SQLite lock collisions during high-concurrency event loops.
-
-### 2. Networking Topology
 - **`backend`**: Runs on port `8000`. Exposes FastAPI swagger docs, REST statistics endpoints, and log buffers.
 - **`frontend`**: Runs on port `3001` (externally). Serves the Next.js visual dashboard, which polls price tick updates, trade states, and terminal logs from `http://localhost:8000`.
+
+### 2. Basic Operations (Start, Stop, Logs)
+
+**Menjalankan Bot (Start):**
+Gunakan perintah ini untuk menjalankan seluruh sistem di latar belakang (detached mode):
+```bash
+docker compose up -d
+```
+
+**Menghentikan Bot (Stop):**
+Jika Anda ingin mematikan bot dengan aman tanpa menghapus data base:
+```bash
+docker compose down
+```
+
+**Melihat Log Sistem secara Live:**
+Untuk melihat apa yang sedang dilakukan bot di balik layar (mirip dengan terminal di dashboard):
+```bash
+# Melihat log dari semua service:
+docker compose logs -f
+
+# Melihat log khusus dari backend (mesin trading utama):
+docker compose logs -f backend
+```
+
+### 3. Memperbarui Sistem (Rebuild & Restart)
+
+Jika Anda melakukan **perubahan pada kode sumber (.py, .ts)** atau **memperbarui file `.env`**, container harus dibangun ulang agar perubahan tersebut diterapkan.
+
+**Jika ada perubahan kode atau .env:**
+```bash
+docker compose up -d --build
+```
+Perintah ini akan memaksa Docker untuk membaca ulang instruksi dari Dockerfile, memperbarui variabel lingkungan dari `.env`, dan melakukan restart otomatis pada container yang berubah tanpa mengganggu container lain yang tidak terpengaruh.
+
+**Jika hanya ingin me-restart mesin tanpa build ulang:**
+```bash
+docker compose restart backend
+```
+
+### 4. Menjalankan Otomatis Saat Komputer Dinyalakan (Auto-Start)
+
+Agar bot ini otomatis berjalan segera setelah komputer / server Linux / PC Anda dinyalakan (meskipun Anda belum login), Anda harus mengkonfigurasi *Restart Policy* di dalam file `docker-compose.yml`.
+
+Sistem ini seharusnya sudah diatur dengan `restart: always` atau `restart: unless-stopped`. 
+
+- **`always`**: Selalu me-restart container jika mati, dan otomatis berjalan saat Docker daemon / komputer *startup*.
+- **`unless-stopped`**: Sama seperti always, namun jika Anda mematikannya secara manual via `docker compose down` atau `docker stop`, container tidak akan menyala otomatis saat komputer dihidupkan ulang.
+
+**Cara Memastikan:**
+Buka file `docker-compose.yml` Anda, pastikan ada baris `restart: unless-stopped` di bawah masing-masing service (`frontend` dan `backend`).
+```yaml
+services:
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    # ...
+```
+Dengan konfigurasi ini, jika Anda membiarkan bot berjalan dengan `docker compose up -d` lalu tiba-tiba mati lampu atau PC *restart*, bot akan otomatis menyala kembali dan langsung berdagang sesaat setelah sistem operasi *booting*.
 
 ---
 

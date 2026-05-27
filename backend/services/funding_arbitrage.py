@@ -7,10 +7,10 @@ class FundingArbitrageAgent:
         self.is_active = False
         self.arbitrage_opportunities = []
         self._last_update_time = 0.0
-
-    def get_opportunities(self):
+    async def get_opportunities(self):
         """Fetch real funding opportunities across active markets."""
         import time
+        import asyncio
         now = time.time()
         
         # Cache for 60 seconds to avoid API spam
@@ -26,7 +26,7 @@ class FundingArbitrageAgent:
             
         try:
             # hl_client.info.meta_and_asset_ctxs() returns [meta, ctxs]
-            meta_and_ctxs = hl_client.info.meta_and_asset_ctxs()
+            meta_and_ctxs = await asyncio.to_thread(hl_client.info.meta_and_asset_ctxs)
             universe = meta_and_ctxs[0].get("universe", [])
             ctxs = meta_and_ctxs[1]
             
@@ -74,7 +74,7 @@ class FundingArbitrageAgent:
         db.log_system("FUNDING_ARB", f"Funding Arbitrage Cash-and-Carry agent status set to: {'ENABLED' if status else 'DISABLED'}")
         return True
 
-    def run_arbitrage_checks(self):
+    async def run_arbitrage_checks(self):
         """Called periodically inside main bot cycle to evaluate entry/exits if enabled."""
         if not self.is_active:
             return
@@ -86,7 +86,7 @@ class FundingArbitrageAgent:
         if not hasattr(self, '_last_check') or now - self._last_check > 300:
             self._last_check = now
             
-            opportunities = self.get_opportunities()
+            opportunities = await self.get_opportunities()
             if opportunities:
                 top_opp = opportunities[0]
                 coin = top_opp["coin"]
@@ -107,7 +107,7 @@ class FundingArbitrageAgent:
                         # Risk Gatekeeper Evaluation
                         from backend.services.risk_manager import risk_manager
                         timestamp_ms = int(time.time() * 1000)
-                        approved, reason, size = risk_manager.evaluate_order(
+                        approved, reason, size = await risk_manager.evaluate_order(
                             coin=coin,
                             side="SHORT",
                             price=mid_px,
@@ -117,7 +117,7 @@ class FundingArbitrageAgent:
                         if approved:
                             # Set slippage price
                             exec_price = mid_px * 0.995
-                            hl_client.place_order(
+                            await hl_client.place_order(
                                 coin=coin,
                                 is_buy=False,
                                 size=size,

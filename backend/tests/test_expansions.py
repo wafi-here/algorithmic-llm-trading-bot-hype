@@ -18,7 +18,8 @@ from backend.services.risk_manager import RiskManager
 from backend.services.backtester import HistoricalBacktester
 from backend.services.pairs_scanner import CointegratedPairsScanner
 
-def test_kelly_criterion_sizing():
+@pytest.mark.asyncio
+async def test_kelly_criterion_sizing():
     """Verify Kelly Criterion computes mathematically correct sizing fractions from rolling performance statistics."""
     test_db_path = "/tmp/test_kelly_bot.db"
     if os.path.exists(test_db_path):
@@ -48,22 +49,36 @@ def test_kelly_criterion_sizing():
     # 2. Risk Manager Kelly Sizing
     manager = RiskManager()
     manager.daily_starting_equity = 10000.0
+    manager.last_sync_time = time.time()  # Skip network sync
     
     # Mock database to point to our test database manager
     import backend.services.risk_manager as rm
     original_db = rm.db
     rm.db = db  # Temporary hot-patch
     
+    # Mock hl_client to return a fake user state with $10000 account
+    from unittest.mock import AsyncMock, patch
+    mock_user_state = {
+        "crossMarginSummary": {"accountValue": "10000.0", "totalMarginUsed": "0.0"},
+        "marginSummary": {"accountValue": "10000.0", "totalMarginUsed": "0.0", "withdrawable": "10000.0"},
+        "assetPositions": [],
+    }
+    
     try:
-        now_ms = int(time.time() * 1000)
-        approved, reason, size = manager.evaluate_order("BTC", "LONG", 60000.0, now_ms)
-        
-        # Balance = 10000.0 (mock)
-        # Clamped Alloc = min(Config.MAX_EXPOSURE_PCT, Half-Kelly) = min(0.20, 0.25) = 0.20 (20%)
-        # Risk Amount = 10000 * 0.20 = 2000.0
-        # Size = 2000.0 / 60000.0 = 0.033333... -> rounded for BTC is 0.0333
-        assert approved is True
-        assert size == 0.0333
+        with patch("backend.services.risk_manager.hl_client") as mock_hl:
+            mock_hl.get_user_state = AsyncMock(return_value=mock_user_state)
+            mock_hl.is_active = True
+            
+            now_ms = int(time.time() * 1000)
+            approved, reason, size = await manager.evaluate_order("BTC", "LONG", 60000.0, now_ms)
+            
+            # Balance = 10000.0 (mock)
+            # Clamped Alloc = min(Config.MAX_EXPOSURE_PCT, Half-Kelly) = min(0.20, 0.25) = 0.20 (20%)
+            # Risk Amount = 10000 * 0.20 = 2000.0
+            # Size = 2000.0 / 60000.0 = 0.033333...
+            # BTC szDecimals=5 (from fallback) → rounded to 0.03333
+            assert approved is True, f"Expected approved, got: {reason}"
+            assert size == 0.03333, f"Expected 0.03333, got {size}"
     finally:
         rm.db = original_db
         db = None

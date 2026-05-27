@@ -1,4 +1,5 @@
 import time
+import math
 from backend.config import Config
 from backend.services.database import db
 from backend.services.hyperliquid_client import hl_client
@@ -14,13 +15,18 @@ class RiskManager:
         self.is_halted = False
         self.daily_starting_equity = 7.42 # Will fetch from user state dynamically
         self.last_sync_time = 0.0
+        
+        # Cached account state for margin pre-checks (updated during sync_equity)
+        self._cached_account_value = 0.0
+        self._cached_margin_used = 0.0
+        self._cached_leverage = 50  # Default for micro accounts
 
-    def sync_equity(self):
+    async def sync_equity(self):
         """Fetches latest wallet equity. Only resets daily_starting_equity at true day boundaries (midnight UTC)."""
         now = time.time()
         # Sync every 10 minutes
         if now - self.last_sync_time > 600:
-            user_state = hl_client.get_user_state()
+            user_state = await hl_client.get_user_state()
             if user_state and "marginSummary" in user_state:
                 summary = user_state["marginSummary"]
                 current_equity = float(summary.get("accountValue", 7.42))
@@ -39,9 +45,58 @@ class RiskManager:
                 self.last_sync_time = now
                 db.log_system("RISK", f"Equity sync completed. Current: ${current_equity:.2f} | Daily Start: ${self.daily_starting_equity:.2f}")
 
-    def evaluate_order(self, coin: str, side: str, price: float, timestamp_ms: float) -> tuple[bool, str, float]:
+    def get_free_margin(self, account_value: float, margin_used: float) -> float:
+        """Calculates the free (available) margin from account value and margin used.
+        Returns: Free margin amount in USD. Can be negative if underwater.
+        """
+        return account_value - margin_used
+
+    def estimate_required_margin(self, notional_value: float, leverage: int) -> float:
+        """Estimates the margin that will be locked for a given order.
+        Args:
+            notional_value: Total notional value of the order in USD (size * price)
+            leverage: Active leverage multiplier for the coin
+        Returns: Estimated margin requirement in USD.
+        """
+        if leverage <= 0:
+            leverage = 1
+        return notional_value / leverage
+
+    def get_asset_sz_decimals(self, coin: str) -> tuple[int, float]:
+        """Gets the size decimal precision and minimum step size for a coin.
+        Uses dynamic metadata from UniverseManager if available, falls back to hardcoded defaults.
+        Returns: Tuple (sz_decimals, min_step_size)
+        """
+        # Try dynamic lookup from cached universe metadata first
+        from backend.services.universe_manager import universe_manager
+        meta = universe_manager.get_asset_metadata(coin)
+        if meta:
+            return (meta["sz_decimals"], meta["min_step"])
+        
+        # Hardcoded fallback for when metadata hasn't been fetched yet (first few cycles)
+        fallback_specs = {
+            "BTC": (5, 0.00001),
+            "ETH": (4, 0.0001),
+            "DOGE": (0, 1.0),
+            "SUI": (1, 0.1),
+            "SOL": (2, 0.01),
+            "NEAR": (1, 0.1),
+            "AVAX": (2, 0.01),
+            "HYPE": (2, 0.01),
+            "WLD": (1, 0.1),
+            "XRP": (0, 1.0),
+            "INJ": (1, 0.1),
+            "LINK": (1, 0.1),
+            "ARB": (1, 0.1),
+            "BNB": (3, 0.001),
+            "TAO": (3, 0.001),
+        }
+        return fallback_specs.get(coin, (2, 0.01))
+
+    async def evaluate_order(self, coin: str, side: str, price: float, timestamp_ms: float) -> tuple[bool, str, float]:
         """
         Validates whether an order complies with the strict risk boundaries.
+        Includes margin pre-check to avoid sending doomed orders to the exchange.
         Returns: Tuple (is_approved: bool, reason: str, calculated_size: float)
         """
         # 1. Halted Circuit Breaker Check
@@ -55,14 +110,25 @@ class RiskManager:
             return False, f"Signal rejected: Stale signal latency is {latency}ms (Limit is {self.latency_limit_ms}ms)", 0.0
 
         # Sync equity balances
-        self.sync_equity()
+        await self.sync_equity()
 
         # Fetch live state
-        user_state = hl_client.get_user_state()
+        user_state = await hl_client.get_user_state()
         if not user_state:
             return False, "Failed to fetch user state from Hyperliquid", 0.0
             
-        margin_summary = user_state.get("marginSummary", {})
+        # Check both cross and isolated margin summaries
+        cross_summary = user_state.get("crossMarginSummary", {})
+        isolated_summary = user_state.get("marginSummary", {})
+        
+        cross_val = float(cross_summary.get("accountValue", 0.0))
+        isolated_val = float(isolated_summary.get("accountValue", 0.0))
+        
+        if cross_val > 0 or isolated_val == 0:
+            margin_summary = cross_summary
+        else:
+            margin_summary = isolated_summary
+            
         account_value = float(margin_summary.get("accountValue", 7.42))
         margin_used = float(margin_summary.get("totalMarginUsed", 0.0))
         
@@ -71,12 +137,25 @@ class RiskManager:
             account_value = max(self.daily_starting_equity, 7.42)
             db.log_system("RISK", f"Account value reported as 0. Using fallback equity: ${account_value:.2f}")
         
+        # Cache these values for external pre-check queries
+        self._cached_account_value = account_value
+        self._cached_margin_used = margin_used
+        
+        # Determine active leverage for this account tier
+        if account_value < 50.0:
+            active_leverage = 50
+        elif account_value < 500.0:
+            active_leverage = 20
+        else:
+            active_leverage = 5
+        self._cached_leverage = active_leverage
+        
         # 3. Daily Drawdown Circuit Breaker
         if self.daily_starting_equity > 0:
             current_drawdown = (account_value - self.daily_starting_equity) / self.daily_starting_equity
             if current_drawdown <= -self.daily_drawdown_limit:
                 self.is_halted = True
-                hl_client.cancel_all_orders()
+                await hl_client.cancel_all_orders()
                 db.log_system("CRITICAL", f"DAILY DRAWDOWN LIMIT BREACHED: {current_drawdown*100:.2f}%. Activating emergency HALT.")
                 return False, "Daily drawdown limit breached, circuit breaker activated!", 0.0
             
@@ -129,18 +208,8 @@ class RiskManager:
             return False, "Invalid price (zero or negative)", 0.0
         calculated_size = risk_amount / price
         
-        # Define step size (decimals) and minimum size per coin
-        coin_specs = {
-            "BTC": (4, 0.0001),
-            "ETH": (3, 0.001),
-            "DOGE": (0, 1.0),
-            "SUI": (1, 0.1),
-            "SOL": (2, 0.01),
-            "NEAR": (1, 0.1),
-            "AVAX": (1, 0.1)
-        }
-        
-        decimals, min_size = coin_specs.get(coin, (2, 0.01))
+        # Dynamic size rounding using API metadata (or fallback)
+        decimals, min_size = self.get_asset_sz_decimals(coin)
         
         # Initial rounded size
         rounded_size = round(calculated_size, decimals)
@@ -149,18 +218,87 @@ class RiskManager:
             
         # Ensure notional value is strictly >= $11.00 to satisfy Hyperliquid's minimum limit
         if rounded_size * price < 11.0:
-            import math
             required_size = 11.0 / price
             step = 10 ** (-decimals) if decimals > 0 else 1.0
             steps = math.ceil(required_size / step)
             rounded_size = round(steps * step, decimals)
+        
+        # 6. MARGIN PRE-CHECK (NEW)
+        # Estimate if the account has enough free margin to support this order
+        # This prevents sending doomed orders that the exchange will reject
+        notional_value = rounded_size * price
+        required_margin = self.estimate_required_margin(notional_value, active_leverage)
+        free_margin = self.get_free_margin(account_value, margin_used)
+        
+        # Apply 20% safety buffer to avoid borderline rejections
+        margin_with_buffer = required_margin * 1.2
+        
+        if free_margin < margin_with_buffer:
+            return False, (
+                f"Margin pre-check FAILED for {coin}. "
+                f"Free margin: ${free_margin:.2f}, Required (with 20% buffer): ${margin_with_buffer:.2f}. "
+                f"Notional: ${notional_value:.2f}, Leverage: {active_leverage}x. "
+                f"Skipping to avoid exchange rejection."
+            ), 0.0
             
         return True, "Order approved by risk gatekeeper", rounded_size
 
-    def trigger_emergency_kill(self):
+    async def check_margin_feasibility(self, coin: str, price: float, min_notional: float = 11.0) -> tuple[bool, str]:
+        """Quick margin feasibility check without full risk evaluation.
+        Used by the main loop to pre-filter coins before running full evaluate_order().
+        
+        Args:
+            coin: The coin symbol
+            price: Current mid price
+            min_notional: Minimum notional value for the order (default $11)
+        
+        Returns: Tuple (is_feasible: bool, reason: str)
+        """
+        user_state = await hl_client.get_user_state()
+        if not user_state:
+            return False, "Cannot fetch user state"
+        
+        cross_summary = user_state.get("crossMarginSummary", {})
+        isolated_summary = user_state.get("marginSummary", {})
+        
+        cross_val = float(cross_summary.get("accountValue", 0.0))
+        isolated_val = float(isolated_summary.get("accountValue", 0.0))
+        
+        if cross_val > 0 or isolated_val == 0:
+            margin_summary = cross_summary
+        else:
+            margin_summary = isolated_summary
+        
+        account_value = float(margin_summary.get("accountValue", 0.0))
+        margin_used = float(margin_summary.get("totalMarginUsed", 0.0))
+        
+        if account_value <= 0:
+            account_value = max(self.daily_starting_equity, 7.42)
+        
+        # Determine leverage
+        if account_value < 50.0:
+            leverage = 50
+        elif account_value < 500.0:
+            leverage = 20
+        else:
+            leverage = 5
+        
+        free_margin = self.get_free_margin(account_value, margin_used)
+        required_margin = self.estimate_required_margin(min_notional, leverage)
+        margin_with_buffer = required_margin * 1.2
+        
+        if free_margin < margin_with_buffer:
+            return False, (
+                f"Insufficient free margin for {coin}: "
+                f"${free_margin:.2f} available, ${margin_with_buffer:.2f} needed"
+            )
+        
+        return True, f"Margin feasible for {coin}: ${free_margin:.2f} free, ${margin_with_buffer:.2f} needed"
+
+    async def trigger_emergency_kill(self):
         """Manual activation of kill switch."""
         self.is_halted = True
-        hl_client.cancel_all_orders()
+        await hl_client.cancel_all_orders()
         db.log_system("EMERGENCY", "User manually triggered the global EMERGENCY HALT (Kill Switch). Bot is locked.")
         return True
 
@@ -172,3 +310,4 @@ class RiskManager:
 
 # Singleton instance
 risk_manager = RiskManager()
+

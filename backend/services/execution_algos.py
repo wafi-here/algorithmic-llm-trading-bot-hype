@@ -30,7 +30,7 @@ class ExecutionAlgos:
             # Slippage tolerance
             exec_price = price * 1.005 if is_buy else price * 0.995
             
-            hl_client.place_order(coin, is_buy, slice_size, exec_price)
+            await hl_client.place_order(coin, is_buy, slice_size, exec_price)
             
             if idx < slices - 1:
                 await asyncio.sleep(interval)
@@ -66,7 +66,7 @@ class ExecutionAlgos:
             db.log_system("EXECUTION_ALGO", f"VWAP Slice {idx+1}/{slices} (Weight: {slice_weight*100:.1f}%) | Sizing: {slice_size:.4f} at: ${price:.2f}")
             
             exec_price = price * 1.005 if is_buy else price * 0.995
-            hl_client.place_order(coin, is_buy, slice_size, exec_price)
+            await hl_client.place_order(coin, is_buy, slice_size, exec_price)
             
             if idx < slices - 1:
                 await asyncio.sleep(interval)
@@ -97,7 +97,7 @@ class ExecutionAlgos:
             db.log_system("EXECUTION_ALGO", f"Iceberg Slice {slice_idx} | Placing size: {current_slice:.4f} at: ${price:.2f} (Remaining: {remaining_size-current_slice:.4f})")
             
             exec_price = price * 1.005 if is_buy else price * 0.995
-            hl_client.place_order(coin, is_buy, current_slice, exec_price)
+            await hl_client.place_order(coin, is_buy, current_slice, exec_price)
             
             remaining_size -= current_slice
             slice_idx += 1
@@ -125,10 +125,10 @@ class ExecutionAlgos:
         if signals.get("adverse_selection_halt", False):
             db.log_system("EXECUTION_MM", f"Adverse Selection Halted on {coin}. Cancelling all resting MM orders.")
             if self.active_mm_orders[coin]["bid_oid"]:
-                hl_client.cancel_order(coin, self.active_mm_orders[coin]["bid_oid"])
+                await hl_client.cancel_order(coin, self.active_mm_orders[coin]["bid_oid"])
                 self.active_mm_orders[coin]["bid_oid"] = None
             if self.active_mm_orders[coin]["ask_oid"]:
-                hl_client.cancel_order(coin, self.active_mm_orders[coin]["ask_oid"])
+                await hl_client.cancel_order(coin, self.active_mm_orders[coin]["ask_oid"])
                 self.active_mm_orders[coin]["ask_oid"] = None
             return
 
@@ -138,7 +138,7 @@ class ExecutionAlgos:
         if optimal_bid == 0.0 or optimal_ask == 0.0:
             return
 
-        open_orders = hl_client.get_open_orders(coin)
+        open_orders = await hl_client.get_open_orders(coin)
         open_oids = [o.get("oid") for o in open_orders]
         
         # 2. Check and manage Bid
@@ -151,13 +151,13 @@ class ExecutionAlgos:
             if order_data:
                 current_price = float(order_data.get("limitPx", 0.0))
                 drift = abs(current_price - optimal_bid) / optimal_bid
-                if drift < 0.0005: # 0.05% drift tolerance
+                if drift < 0.005: # 0.5% drift tolerance
                     needs_new_bid = False
                 else:
-                    hl_client.cancel_order(coin, current_bid_oid)
+                    await hl_client.cancel_order(coin, current_bid_oid)
                     
         if needs_new_bid:
-            res = hl_client.place_order(coin, is_buy=True, size=size, price=optimal_bid)
+            res = await hl_client.place_order(coin, is_buy=True, size=size, price=optimal_bid)
             if res.get("status") == "ok":
                 # Extract OID from response if available
                 new_oid = res.get("response", {}).get("data", {}).get("statuses", [{}])[0].get("resting", {}).get("oid")
@@ -174,13 +174,13 @@ class ExecutionAlgos:
             if order_data:
                 current_price = float(order_data.get("limitPx", 0.0))
                 drift = abs(current_price - optimal_ask) / optimal_ask
-                if drift < 0.0005:
+                if drift < 0.005: # 0.5% drift tolerance
                     needs_new_ask = False
                 else:
-                    hl_client.cancel_order(coin, current_ask_oid)
+                    await hl_client.cancel_order(coin, current_ask_oid)
                     
         if needs_new_ask:
-            res = hl_client.place_order(coin, is_buy=False, size=size, price=optimal_ask)
+            res = await hl_client.place_order(coin, is_buy=False, size=size, price=optimal_ask)
             if res.get("status") == "ok":
                 new_oid = res.get("response", {}).get("data", {}).get("statuses", [{}])[0].get("resting", {}).get("oid")
                 if not new_oid:
@@ -204,29 +204,34 @@ class ExecutionAlgos:
             self.active_grid_orders[coin] = []
             
         # Fetch current open orders
-        open_orders = hl_client.get_open_orders(coin)
+        open_orders = await hl_client.get_open_orders(coin)
         open_oids = [o.get("oid") for o in open_orders]
         
         # Verify grid integrity
         active_grid_oids = [oid for oid in self.active_grid_orders[coin] if oid in open_oids]
         
-        # If the number of active grid orders drops (meaning a level filled), or it's empty
-        # We replace the entire grid around the new price for simplicity in this V1 execution engine.
-        total_grid_size = len(buy_levels) + len(sell_levels)
-        
-        if len(active_grid_oids) < total_grid_size:
-            db.log_system("EXECUTION_GRID", f"Grid integrity breached for {coin} (fills detected). Resetting Grid array.")
+        # Grid integrity check: reset if any successfully placed order got filled, or if we have no active grid orders at all
+        should_reset = False
+        if not self.active_grid_orders[coin]:
+            # No orders tracked yet, place the initial grid
+            should_reset = True
+        elif len(active_grid_oids) < len(self.active_grid_orders[coin]):
+            # An order was filled!
+            should_reset = True
+            
+        if should_reset:
+            db.log_system("EXECUTION_GRID", f"Grid integrity breached for {coin} (fills detected or empty). Resetting Grid array.")
             
             # Cancel remaining old grid orders
             for oid in active_grid_oids:
-                hl_client.cancel_order(coin, oid)
+                await hl_client.cancel_order(coin, oid)
                 
             self.active_grid_orders[coin] = []
             
             # Place new grid
             for level in buy_levels:
                 size = base_size * level["size"]
-                res = hl_client.place_order(coin, is_buy=True, size=size, price=level["price"])
+                res = await hl_client.place_order(coin, is_buy=True, size=size, price=level["price"])
                 if res.get("status") == "ok":
                     new_oid = res.get("response", {}).get("data", {}).get("statuses", [{}])[0].get("resting", {}).get("oid")
                     if new_oid:
@@ -236,7 +241,7 @@ class ExecutionAlgos:
                         
             for level in sell_levels:
                 size = base_size * level["size"]
-                res = hl_client.place_order(coin, is_buy=False, size=size, price=level["price"])
+                res = await hl_client.place_order(coin, is_buy=False, size=size, price=level["price"])
                 if res.get("status") == "ok":
                     new_oid = res.get("response", {}).get("data", {}).get("statuses", [{}])[0].get("resting", {}).get("oid")
                     if new_oid:

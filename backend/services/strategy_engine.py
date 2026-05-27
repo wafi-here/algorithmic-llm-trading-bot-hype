@@ -98,7 +98,10 @@ class StrategyEngine:
             
             if price_a > 0.0 and price_b > 0.0:
                 spread = price_a - (ratio * price_b)
-                self.spread_buffers[f"{a}_{b}"].append(spread)
+                pair_key = f"{a}_{b}"
+                if pair_key not in self.spread_buffers:
+                    self.spread_buffers[pair_key] = deque(maxlen=self.window_size)
+                self.spread_buffers[pair_key].append(spread)
                 
         # Add the custom runtime pair from constructor if not present
         custom_key = f"{self.asset_a}_{self.asset_b}"

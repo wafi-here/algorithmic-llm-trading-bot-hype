@@ -26,7 +26,7 @@ export default function Home() {
   const [logs, setLogs] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(false);
-  const [backendUrl, setBackendUrl] = useState("http://localhost:8000");
+  const [backendUrl, setBackendUrl] = useState("");
   const [pairsData, setPairsData] = useState<any[]>([]);
   const [fundingData, setFundingData] = useState<any>(null);
   const [backtestResult, setBacktestResult] = useState<any>(null);

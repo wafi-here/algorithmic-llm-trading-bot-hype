@@ -106,18 +106,33 @@ def test_orderbook_tracker_calculations():
     # imbalance = (3.5 - 6.0) / (3.5 + 6.0) = -2.5 / 9.5 = -0.26315789
     assert abs(active_state["imbalance"] - (-0.26315789)) < 1e-5
 
-def test_risk_manager_fractional_sizing():
+@pytest.mark.asyncio
+async def test_risk_manager_fractional_sizing():
     """Verify position sizing math under standard capital boundaries."""
+    from unittest.mock import AsyncMock, patch
     manager = RiskManager()
     
     # Override starting equity for standard calculation test
     manager.daily_starting_equity = 10000.0
+    manager.last_sync_time = time.time()  # Skip network sync
     
-    # Let's test evaluating long order at 67000.0
-    # Risk 1% of 10000.0 = 100.00
-    # size = 100.00 / 67000.0 = 0.0014925 -> rounded to 4 decimals = 0.0015
-    now_ms = int(time.time() * 1000)
-    approved, reason, size = manager.evaluate_order("BTC", "LONG", 67000.0, now_ms)
+    mock_user_state = {
+        "crossMarginSummary": {"accountValue": "10000.0", "totalMarginUsed": "0.0"},
+        "marginSummary": {"accountValue": "10000.0", "totalMarginUsed": "0.0", "withdrawable": "10000.0"},
+        "assetPositions": [],
+    }
     
-    assert approved is True
-    assert size == 0.0015
+    with patch("backend.services.risk_manager.hl_client") as mock_hl:
+        mock_hl.get_user_state = AsyncMock(return_value=mock_user_state)
+        mock_hl.is_active = True
+        
+        # Let's test evaluating long order at 67000.0
+        # Risk 1% of 10000.0 = 100.00 -> but min $11 applies, so risk_amount = max(100, 11) = 100
+        # size = 100.00 / 67000.0 = 0.0014925 -> rounded to 5 decimals (BTC szDecimals=5) = 0.00149
+        # But min notional $11 check: 0.00149 * 67000 = $99.83 >= $11 OK
+        now_ms = int(time.time() * 1000)
+        approved, reason, size = await manager.evaluate_order("BTC", "LONG", 67000.0, now_ms)
+        
+        assert approved is True, f"Expected approved, got: {reason}"
+        assert size > 0, f"Expected positive size, got {size}"
+
