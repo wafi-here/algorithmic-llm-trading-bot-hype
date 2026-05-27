@@ -44,8 +44,10 @@ async def trading_bot_loop():
     
     # Run initial news scraping sentiment update
     try:
-        avg_sentiment = await sentiment_engine.scrape_and_analyze()
-        strategy_engine.update_sentiment(avg_sentiment)
+        sentiment_data = await sentiment_engine.scrape_and_analyze()
+        avg_sentiment = sentiment_data.get("score", 0.0)
+        avg_confidence = sentiment_data.get("confidence", 0.5)
+        strategy_engine.update_sentiment(avg_sentiment, avg_confidence)
     except Exception as e:
         db.log_system("WARNING", f"Initial sentiment scrape failed: {str(e)}")
         
@@ -86,16 +88,49 @@ async def trading_bot_loop():
                 last_universe_scan = now
 
             # ============================================================
+            # P1: Fetch user_state ONCE at the top of each cycle.
+            # This eliminates 50-70% of redundant get_user_state() API calls
+            # that were previously scattered across risk_manager, margin checks,
+            # and grid/MM threshold checks.
+            # ============================================================
+            cycle_user_state = await hl_client.get_user_state()
+            
+            # S2: Determine account tier once for signal architecture decisions
+            is_micro_account = True
+            account_value = 0.0
+            if cycle_user_state:
+                cross_val = float(cycle_user_state.get("crossMarginSummary", {}).get("accountValue", "0.0"))
+                isolated_val = float(cycle_user_state.get("marginSummary", {}).get("accountValue", "0.0"))
+                account_value = max(cross_val, isolated_val)
+                if account_value >= 50.0:
+                    is_micro_account = False
+                elif cycle_user_state.get("is_mock", False):
+                    is_micro_account = False
+            
+            # ============================================================
             # STEP 1.5: TRAILING STOP CHECK (Lean-inspired, runs FIRST)
             # Risk management ALWAYS takes priority over alpha signals.
             # This checks every tracked position for stop/TP/expiry triggers.
             # ============================================================
+            # Risk management ALWAYS takes priority over alpha signals.
+            # This checks every tracked position for stop/TP/expiry triggers.
+            # ============================================================
             current_prices = {}
-            for coin in universe_manager.get_active_universe():
+            
+            # Ensure we fetch prices for ALL currently open/tracked positions
+            for coin in trailing_stop_manager.positions.keys():
                 state = tracker.get_market_state(coin)
                 mid = state.get("mid", 0.0)
                 if mid > 0:
                     current_prices[coin] = mid
+                    
+            # Also fetch for the active universe
+            for coin in universe_manager.get_active_universe():
+                if coin not in current_prices:
+                    state = tracker.get_market_state(coin)
+                    mid = state.get("mid", 0.0)
+                    if mid > 0:
+                        current_prices[coin] = mid
             
             # Update trailing stop peak tracking
             trailing_stop_manager.update_prices(current_prices)
@@ -144,11 +179,6 @@ async def trading_bot_loop():
             if strat_result and "signals" in strat_result:
                 zscore_signals = strat_result["signals"]
             
-            # Build a ranked signal list from ALL coins in the active universe
-            # Each entry: {"coin": str, "action": str, "strength": int, "sources": [str]}
-            # strength: 3 = Z-Score + Momentum + Breakout, 2 = Momentum + Breakout consensus, 1 = Z-Score only
-            ranked_signals = []
-            
             # Collect coins to evaluate: primary pair + all universe coins
             coins_to_evaluate = set()
             coins_to_evaluate.add(strategy_engine.asset_a)
@@ -157,70 +187,54 @@ async def trading_bot_loop():
                 coins_to_evaluate.add(coin)
             coins_to_evaluate.discard(None)
             
+            # Emit insights to the manager
+            # S2: For micro accounts (<$50), only emit Momentum + OBI signals.
+            # Z-score and Breakout are suppressed because:
+            # (a) Z-score pairs trading can't be hedged at this capital level
+            # (b) Breakout conflicts with momentum signals, weakening consensus
+            # This produces clearer, higher-conviction directional signals.
             for coin in coins_to_evaluate:
                 mom_sig = strategy_engine.calculate_momentum_signals(coin)
-                brk_sig = strategy_engine.calculate_volatility_breakout(coin)
                 obi_sig = strategy_engine.calculate_orderbook_imbalance_signal(coin)
-                zs_sig = zscore_signals.get(coin)
                 
-                # Determine the best action and its strength for this coin
-                action = None
-                strength = 0
-                sources = []
+                # Always emit momentum and OBI (universally useful)
+                if mom_sig:
+                    insight_manager.emit(Insight(coin, mom_sig, confidence=0.7, magnitude=0.01, period_seconds=300, source="Momentum"))
+                if obi_sig:
+                    insight_manager.emit(Insight(coin, obi_sig, confidence=0.8, magnitude=0.005, period_seconds=60, source="OBI"))
                 
-                # Priority 1: Full Triple Consensus (Z-Score + Momentum + Breakout)
-                if zs_sig and mom_sig and brk_sig and zs_sig == mom_sig == brk_sig and zs_sig != "FLAT":
-                    action = zs_sig
-                    strength = 3
-                    sources = ["Z-Score", "Momentum", "Breakout"]
-                    # OBI confirmation boosts to max-strength signal
-                    if obi_sig == zs_sig:
-                        strength = 4
-                        sources.append("OBI")
-                
-                # Priority 2: Z-Score signal confirmed by at least one trend indicator
-                elif zs_sig and zs_sig != "FLAT" and (mom_sig == zs_sig or brk_sig == zs_sig):
-                    action = zs_sig
-                    strength = 2
-                    confirmer = "Momentum" if mom_sig == zs_sig else "Breakout"
-                    sources = ["Z-Score", confirmer]
-                    # OBI confirmation boosts strength
-                    if obi_sig == zs_sig:
-                        strength = 3
-                        sources.append("OBI")
-                
-                # Priority 2.5: OBI confirms a standalone Z-Score signal (microstructure + stat arb)
-                elif zs_sig and zs_sig != "FLAT" and obi_sig == zs_sig:
-                    action = zs_sig
-                    strength = 2
-                    sources = ["Z-Score", "OBI"]
-                
-                # Priority 3: Strong Consensus from Momentum + Breakout (no Z-Score)
-                elif mom_sig and brk_sig and mom_sig == brk_sig and mom_sig != "FLAT":
-                    action = mom_sig
-                    strength = 2
-                    sources = ["Momentum", "Breakout"]
-                    if obi_sig == mom_sig:
-                        strength = 3
-                        sources.append("OBI")
-                    db.log_system("STRATEGY_CONSENSUS", f"Strong {mom_sig} consensus from Momentum + Breakout on {coin}")
-                
-                # Priority 4: Z-Score FLAT signal (for exit/take-profit)
-                elif zs_sig == "FLAT":
-                    action = "FLAT"
-                    strength = 1
-                    sources = ["Z-Score"]
-                
-                if action:
-                    ranked_signals.append({
-                        "coin": coin,
-                        "action": action,
-                        "strength": strength,
-                        "sources": sources
-                    })
+                # S2: Only emit Z-score and Breakout for accounts >= $50
+                if not is_micro_account:
+                    brk_sig = strategy_engine.calculate_volatility_breakout(coin)
+                    zs_sig = zscore_signals.get(coin)
+                    
+                    if brk_sig and brk_sig != "FLAT":
+                        insight_manager.emit(Insight(coin, brk_sig, confidence=0.6, magnitude=0.02, period_seconds=300, source="Breakout"))
+                    if zs_sig:
+                        insight_manager.emit(Insight(coin, zs_sig, confidence=0.9, magnitude=0.015, period_seconds=600, source="Z-Score"))
+                else:
+                    # For micro accounts, still emit FLAT Z-score signals for exit handling
+                    zs_sig = zscore_signals.get(coin)
+                    if zs_sig and zs_sig == "FLAT":
+                        insight_manager.emit(Insight(coin, zs_sig, confidence=0.9, magnitude=0.015, period_seconds=600, source="Z-Score"))
+
+            # Retrieve processed consensus from InsightManager
+            ranked_insights = insight_manager.get_ranked_signals(coins_to_evaluate)
+            flat_signals = insight_manager.get_flat_signals(coins_to_evaluate)
             
-            # Sort by strength descending (strongest signals first)
-            ranked_signals.sort(key=lambda x: x["strength"], reverse=True)
+            # Exit signals (FLAT) take priority over entries, so put them first
+            consensus_list = flat_signals + ranked_insights
+            
+            # Map InsightConsensus to the downstream format
+            ranked_signals = []
+            for consensus in consensus_list:
+                ranked_signals.append({
+                    "coin": consensus.coin,
+                    "action": consensus.direction,
+                    "strength": consensus.strength,
+                    "sources": consensus.sources,
+                    "confidence": consensus.confidence
+                })
             
             # Process ranked signals with margin pre-check
             executed_any = False
@@ -244,20 +258,21 @@ async def trading_bot_loop():
                     
                 timestamp_ms = int(time.time() * 1000)
                 
-                # Evaluate side vs current active positions to prevent double entries
-                has_position = any(p["coin"] == coin for p in active_positions)
+                # Evaluate side vs current active positions to prevent double entries but allow reversals
+                active_pos = next((p for p in active_positions if p["coin"] == coin), None)
                 
                 # Prevent entering identical position twice
-                if action == "LONG" and has_position:
-                    continue
-                if action == "SHORT" and has_position:
-                    continue
-                if action == "FLAT" and not has_position:
-                    continue
+                if active_pos:
+                    if action == active_pos["side"]:
+                        continue # Already have this exact position
+                    # If we reach here, we have a position but the signal is the OPPOSITE side (reversal)
+                elif action == "FLAT":
+                    continue # No position to close
 
                 # Quick margin feasibility pre-check for entry orders (skip for exits)
+                # P1: Pass cycle_user_state to avoid redundant API call
                 if action != "FLAT":
-                    feasible, feasibility_reason = await risk_manager.check_margin_feasibility(coin, mid_px)
+                    feasible, feasibility_reason = await risk_manager.check_margin_feasibility(coin, mid_px, user_state=cycle_user_state)
                     if not feasible:
                         margin_failures += 1
                         # Only log margin skip once every 5 cycles to avoid log spam
@@ -266,18 +281,29 @@ async def trading_bot_loop():
                         continue
 
                 # Full Risk Gatekeeper Evaluation
+                # P1: Pass cycle_user_state to avoid redundant API call
                 approved, reason, size = await risk_manager.evaluate_order(
                     coin=coin,
                     side=action,
                     price=mid_px,
-                    timestamp_ms=timestamp_ms
+                    timestamp_ms=timestamp_ms,
+                    confidence=signal.get("confidence", 1.0),
+                    user_state=cycle_user_state
                 )
                 
                 if approved:
                     db.log_system("RISK", f"Order APPROVED for {coin} ({action}). Size: {size} | Signal: {'+'.join(sources)} (str={strength:.2f})")
                     
                     # L1 Execution with dynamic slippage (Lean VolumeShareSlippageModel)
-                    is_buy = action == "LONG"
+                    if action == "FLAT":
+                        if active_pos:
+                            is_buy = active_pos["side"] == "SHORT"
+                            size = abs(float(active_pos.get("szi", size)))
+                        else:
+                            continue
+                    else:
+                        is_buy = action == "LONG"
+                        
                     reduce_only = action == "FLAT"
                     
                     # Dynamic slippage replaces static 0.5% buffer
@@ -322,19 +348,10 @@ async def trading_bot_loop():
                             f"Consider depositing more funds or closing existing positions."
                         )
             
-            # 3. Active Market Making and Grid Trading on Top 2 Coins (Bypassed for micro-accounts < $50 to protect request ratio limits)
-            user_state = await hl_client.get_user_state()
-            is_micro = True
-            if user_state:
-                cross_val = float(user_state.get("crossMarginSummary", {}).get("accountValue", 0.0))
-                isolated_val = float(user_state.get("marginSummary", {}).get("accountValue", 0.0))
-                account_val = max(cross_val, isolated_val)
-                if account_val >= 50.0:
-                    is_micro = False
-                elif user_state.get("is_mock", False):
-                    is_micro = False
-
-            if is_micro:
+            # 3. Active Market Making and Grid Trading on Top 2 Coins
+            # (Bypassed for micro-accounts < $50 to protect request ratio limits)
+            # P1: Reuse cycle_user_state — no redundant API call needed
+            if is_micro_account:
                 if BOT_STATUS["cycles_executed"] % 5 == 1:
                     db.log_system("SYSTEM", "Skipping High-Frequency Grid & MM for micro-account (< $50) to protect request-to-volume ratio limits.")
             else:
@@ -376,8 +393,10 @@ async def trading_bot_loop():
 async def update_sentiment_async():
     """Helper to run news scraping in background without blocking the loop."""
     try:
-        avg_sentiment = await sentiment_engine.scrape_and_analyze()
-        strategy_engine.update_sentiment(avg_sentiment)
+        sentiment_data = await sentiment_engine.scrape_and_analyze()
+        avg_sentiment = sentiment_data.get("score", 0.0)
+        avg_confidence = sentiment_data.get("confidence", 0.5)
+        strategy_engine.update_sentiment(avg_sentiment, avg_confidence)
     except Exception as e:
         db.log_system("WARNING", f"Background news sentiment check failed: {str(e)}")
 
@@ -392,6 +411,21 @@ async def lifespan(app: FastAPI):
     # Start the altcoin cointegration pairs scanner service
     scanner.start()
     
+    # Sync existing positions into Trailing Stop Manager
+    try:
+        active_positions = await hl_client.get_positions()
+        for pos in active_positions:
+            if not trailing_stop_manager.has_position(pos["coin"]):
+                trailing_stop_manager.register_position(
+                    coin=pos["coin"],
+                    side=pos["side"],
+                    entry_price=pos["entry_px"],
+                    size=pos["size"]
+                )
+        db.log_system("SYSTEM", f"Synced {len(active_positions)} open positions to Trailing Stop Manager.")
+    except Exception as e:
+        db.log_system("ERROR", f"Failed to sync positions on startup: {str(e)}")
+        
     # Start the background trading loop task
     bot_task = create_background_task(trading_bot_loop())
     background_tasks.add(bot_task)
@@ -530,11 +564,13 @@ async def handle_emergency_control(request: HaltRequest):
 @app.post("/api/scrape-news")
 async def trigger_manual_news_scrape():
     """Force manual sentiment scraper execution."""
-    avg_sentiment = await sentiment_engine.scrape_and_analyze()
-    strategy_engine.update_sentiment(avg_sentiment)
+    sentiment_data = await sentiment_engine.scrape_and_analyze()
+    avg_sentiment = sentiment_data.get("score", 0.0)
+    avg_confidence = sentiment_data.get("confidence", 0.5)
+    strategy_engine.update_sentiment(avg_sentiment, avg_confidence)
     return {
         "status": "success",
-        "average_sentiment": avg_sentiment,
+        "message": f"Sentiment updated manually. Score: {avg_sentiment:.2f}, Confidence: {avg_confidence:.2f}",
         "skewed_zscore_long": -1.5 if avg_sentiment > 0.3 else (-2.5 if avg_sentiment < -0.3 else -2.0)
     }
 

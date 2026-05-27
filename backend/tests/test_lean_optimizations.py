@@ -189,25 +189,40 @@ class TestInsightSystem:
         assert insight.remaining_seconds == 0.0
 
     def test_emit_replaces_same_source(self):
-        """Emitting from the same source should replace the previous insight."""
+        """Emitting from the same source with a different direction should replace."""
         from backend.services.insight import InsightManager, Insight
         
         mgr = InsightManager()
+        # Emit LONG twice to confirm it
         mgr.emit(Insight("BTC", "LONG", 0.5, 0.01, 300, "Z-Score"))
+        mgr.emit(Insight("BTC", "LONG", 0.5, 0.01, 300, "Z-Score"))
+        assert len(mgr.get_active_insights("BTC")) == 1
+        
+        # Now emit SHORT — should replace the LONG (resets confirmation to 1)
         mgr.emit(Insight("BTC", "SHORT", 0.8, -0.01, 300, "Z-Score"))
         
+        # SHORT only has 1 cycle of confirmation, so it won't pass the filter yet
+        # But internal storage should have replaced
+        all_raw = mgr._insights.get("BTC", [])
+        assert len(all_raw) == 1
+        assert all_raw[0].direction == "SHORT"
+        
+        # After second emit (confirmation), it should appear in active
+        mgr.emit(Insight("BTC", "SHORT", 0.8, -0.01, 300, "Z-Score"))
         active = mgr.get_active_insights("BTC")
         assert len(active) == 1
         assert active[0].direction == "SHORT"
 
     def test_consensus_long_with_multiple_sources(self):
-        """Multiple LONG insights should produce LONG consensus."""
+        """Multiple confirmed LONG insights should produce LONG consensus."""
         from backend.services.insight import InsightManager, Insight
         
         mgr = InsightManager()
-        mgr.emit(Insight("BTC", "LONG", 0.9, 0.02, 300, "Z-Score"))
-        mgr.emit(Insight("BTC", "LONG", 0.7, 0.015, 300, "ROC"))
-        mgr.emit(Insight("BTC", "LONG", 0.6, 0.01, 300, "OBI"))
+        # Emit each source twice to reach confirmation threshold (S6)
+        for _ in range(2):
+            mgr.emit(Insight("BTC", "LONG", 0.9, 0.02, 300, "Z-Score"))
+            mgr.emit(Insight("BTC", "LONG", 0.7, 0.015, 300, "ROC"))
+            mgr.emit(Insight("BTC", "LONG", 0.6, 0.01, 300, "OBI"))
         
         consensus = mgr.get_consensus("BTC")
         assert consensus is not None
@@ -232,9 +247,11 @@ class TestInsightSystem:
         from backend.services.insight import InsightManager, Insight
         
         mgr = InsightManager()
-        mgr.emit(Insight("BTC", "LONG", 0.9, 0.03, 300, "Z-Score"))
-        mgr.emit(Insight("BTC", "LONG", 0.7, 0.02, 300, "ROC"))
-        mgr.emit(Insight("BTC", "SHORT", 0.3, -0.005, 300, "OBI"))
+        # Emit each source twice for S6 confirmation
+        for _ in range(2):
+            mgr.emit(Insight("BTC", "LONG", 0.9, 0.03, 300, "Z-Score"))
+            mgr.emit(Insight("BTC", "LONG", 0.7, 0.02, 300, "ROC"))
+            mgr.emit(Insight("BTC", "SHORT", 0.3, -0.005, 300, "OBI"))
         
         consensus = mgr.get_consensus("BTC")
         assert consensus.direction == "LONG"
@@ -247,8 +264,11 @@ class TestInsightSystem:
         # Create already-expired insight
         old = Insight("BTC", "LONG", 0.8, 0.02, 5, "Old")
         old.created_at = time.time() - 10
-        mgr.emit(old)
+        old.consecutive_cycles = 3  # Was confirmed before expiring
+        mgr._insights["BTC"] = [old]  # Directly inject to bypass emit
         
+        # Fresh insight (emit twice for confirmation)
+        mgr.emit(Insight("ETH", "SHORT", 0.6, -0.01, 300, "Fresh"))
         mgr.emit(Insight("ETH", "SHORT", 0.6, -0.01, 300, "Fresh"))
         
         count = mgr.expire_stale()
@@ -261,12 +281,14 @@ class TestInsightSystem:
         from backend.services.insight import InsightManager, Insight
         
         mgr = InsightManager()
-        # High confidence with 2 sources
-        mgr.emit(Insight("BTC", "LONG", 0.9, 0.03, 300, "Z-Score"))
-        mgr.emit(Insight("BTC", "LONG", 0.8, 0.02, 300, "ROC"))
-        
-        # Low confidence with 1 source
-        mgr.emit(Insight("ETH", "SHORT", 0.3, -0.005, 300, "Z-Score"))
+        # Emit each source twice for S6 confirmation
+        for _ in range(2):
+            # High confidence with 2 sources
+            mgr.emit(Insight("BTC", "LONG", 0.9, 0.03, 300, "Z-Score"))
+            mgr.emit(Insight("BTC", "LONG", 0.8, 0.02, 300, "ROC"))
+            
+            # Low confidence with 1 source
+            mgr.emit(Insight("ETH", "SHORT", 0.3, -0.005, 300, "Z-Score"))
         
         signals = mgr.get_ranked_signals({"BTC", "ETH"})
         assert len(signals) == 2
@@ -390,19 +412,21 @@ class TestStackedRiskPipeline:
             "assetPositions": [],
         }
         
-        with patch("backend.services.risk_manager.hl_client") as mock_hl:
-            mock_hl.get_user_state = AsyncMock(return_value=mock_user_state)
-            mock_hl.get_positions = AsyncMock(return_value=[])
-            mock_hl.is_active = True
-            mock_hl.cancel_all_orders = AsyncMock(return_value=True)
-            
-            now_ms = int(time.time() * 1000)
-            
-            # High confidence
-            _, _, size_high = await rm.evaluate_order("BTC", "LONG", 60000.0, now_ms, confidence=0.95)
-            
-            # Low confidence
-            _, _, size_low = await rm.evaluate_order("BTC", "LONG", 60000.0, now_ms, confidence=0.35)
+        with patch("backend.services.risk_manager.db.get_trade_performance_stats") as mock_stats:
+            mock_stats.return_value = {"total_trades": 10, "win_rate": 0.6, "payoff_ratio": 2.0, "max_drawdown": 0.05}
+            with patch("backend.services.risk_manager.hl_client") as mock_hl:
+                mock_hl.get_user_state = AsyncMock(return_value=mock_user_state)
+                mock_hl.get_positions = AsyncMock(return_value=[])
+                mock_hl.is_active = True
+                mock_hl.cancel_all_orders = AsyncMock(return_value=True)
+                
+                now_ms = int(time.time() * 1000)
+                
+                # High confidence
+                _, _, size_high = await rm.evaluate_order("BTC", "LONG", 60000.0, now_ms, confidence=0.95)
+                
+                # Low confidence
+                _, _, size_low = await rm.evaluate_order("BTC", "LONG", 60000.0, now_ms, confidence=0.35)
             
             assert size_high > size_low, f"High confidence size {size_high} should exceed low {size_low}"
 
@@ -421,8 +445,8 @@ class TestStackedRiskPipeline:
             "assetPositions": [],
         }
         
-        # Existing position worth 35% of portfolio
-        existing_positions = [{"coin": "BTC", "szi": "0.06", "entryPx": "60000.0"}]
+        # Existing position worth 35% of portfolio (uses normalized keys from get_positions())
+        existing_positions = [{"coin": "BTC", "size": 0.06, "entry_px": 60000.0, "side": "LONG", "liquidation_px": 0, "unrealized_pnl": 0, "leverage": 1}]
         
         with patch("backend.services.risk_manager.hl_client") as mock_hl:
             mock_hl.get_user_state = AsyncMock(return_value=mock_user_state)

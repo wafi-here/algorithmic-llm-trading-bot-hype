@@ -197,8 +197,10 @@ class DatabaseManager:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                # F3: Use 'pnl IS NOT NULL' to exclude entry records (pnl=NULL),
+                # but include breakeven exits (pnl=0.0) in the performance sample.
                 cursor.execute(
-                    "SELECT pnl FROM executed_trades WHERE pnl IS NOT NULL AND pnl != 0.0 ORDER BY timestamp DESC LIMIT ?",
+                    "SELECT pnl FROM executed_trades WHERE pnl IS NOT NULL ORDER BY timestamp DESC LIMIT ?",
                     (limit,)
                 )
                 rows = cursor.fetchall()

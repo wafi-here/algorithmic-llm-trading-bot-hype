@@ -94,7 +94,7 @@ class RiskManager:
         }
         return fallback_specs.get(coin, (2, 0.01))
 
-    async def evaluate_order(self, coin: str, side: str, price: float, timestamp_ms: float, confidence: float = 1.0) -> tuple[bool, str, float]:
+    async def evaluate_order(self, coin: str, side: str, price: float, timestamp_ms: float, confidence: float = 1.0, user_state: dict = None) -> tuple[bool, str, float]:
         """
         Stacked Risk Management Pipeline (Lean-inspired).
         
@@ -129,8 +129,9 @@ class RiskManager:
         # Sync equity balances
         await self.sync_equity()
 
-        # Fetch live state
-        user_state = await hl_client.get_user_state()
+        # P1: Use passed-in user_state to avoid redundant API calls
+        if user_state is None:
+            user_state = await hl_client.get_user_state()
         if not user_state:
             return False, "Failed to fetch user state from Hyperliquid", 0.0
             
@@ -204,49 +205,61 @@ class RiskManager:
             # Flat/Exit order has no risk limit checks as it reduces risk
             return True, "Exit order approved", 1.0
 
-        # 5. Dynamic Position Sizing (Kelly Criterion with Half-Kelly Cushion)
-        # Fetch rolling performance history
-        stats = db.get_trade_performance_stats(limit=30)
+        # 5. Dynamic Position Sizing (Kelly Criterion with Quarter-Kelly Cushion)
+        # F2: Raised minimum sample from 5 to 30 trades for statistical significance.
+        # Changed from Half-Kelly to Quarter-Kelly per research consensus for crypto.
+        # Added negative-Kelly guard to detect when there's no statistical edge.
+        stats = db.get_trade_performance_stats(limit=50)
         total_trades = stats.get("total_trades", 0)
         
-        if total_trades >= 5:
-            # We have enough history to calculate Kelly parameters
+        if total_trades >= 30:
+            # Sufficient history to calculate Kelly parameters
             win_rate = stats["win_rate"]
             payoff_ratio = stats["payoff_ratio"]
             
             # Kelly Formula: f = W - (1-W)/R
             kelly_f = win_rate - ((1.0 - win_rate) / payoff_ratio if payoff_ratio > 0 else 0.0)
             
-            # Apply Half-Kelly for risk conservation/cushioning
-            half_kelly = kelly_f * 0.5
-            
-            # Calculate adaptive uncertainty penalty
-            uncertainty = self._calculate_uncertainty_index(stats, account_value)
-            
-            # Apply uncertainty-adjusted Kelly: shrinks allocation in dangerous conditions
-            # When uncertainty = 0 → identical to standard Half-Kelly
-            # When uncertainty = 1 → allocation shrinks to floor (0.5%)
-            adjusted_kelly = half_kelly * (1.0 - uncertainty)
-            
-            # NEW: Confidence modulation from Insight system
-            # Higher-confidence insights get up to 100% of Kelly allocation
-            # Lower-confidence insights get proportionally less
-            adjusted_kelly *= max(0.3, confidence)  # Floor at 30% of Kelly even for low confidence
-            
-            # NEW: Correlation guard reduction
-            adjusted_kelly *= correlation_multiplier
-            
-            # Clamp Kelly sizing between 0.5% (minimum) and Config.MAX_EXPOSURE_PCT (maximum)
-            risk_fraction = max(0.005, min(self.max_exposure_pct, adjusted_kelly))
-            db.log_system("RISK", 
-                f"Kelly: {kelly_f:.4f} | Half: {half_kelly:.4f} | Uncertainty: {uncertainty:.3f} | "
-                f"Confidence: {confidence:.2f} | CorrMult: {correlation_multiplier:.2f} | "
-                f"Adaptive: {adjusted_kelly:.4f} | Clamped: {risk_fraction*100:.2f}%")
+            # F2: Negative Kelly guard — if no statistical edge, use minimum sizing
+            if kelly_f <= 0:
+                risk_fraction = 0.005  # 0.5% minimum — no statistical edge detected
+                db.log_system("RISK", 
+                    f"Kelly NEGATIVE: {kelly_f:.4f} (WR={win_rate:.2%}, PR={payoff_ratio:.2f}). "
+                    f"No statistical edge detected. Using minimum 0.5% sizing.")
+            else:
+                # F2: Apply Quarter-Kelly for crypto risk conservation
+                # Research consensus: 10-25% Kelly for volatile assets, never >50%
+                quarter_kelly = kelly_f * 0.25
+                
+                # Calculate adaptive uncertainty penalty
+                uncertainty = self._calculate_uncertainty_index(stats, account_value)
+                
+                # Apply uncertainty-adjusted Kelly: shrinks allocation in dangerous conditions
+                adjusted_kelly = quarter_kelly * (1.0 - uncertainty)
+                
+                # Confidence modulation from Insight system
+                adjusted_kelly *= max(0.3, confidence)
+                
+                # Correlation guard reduction
+                adjusted_kelly *= correlation_multiplier
+                
+                # S7: Volatility regime scaling — reduce size in high-vol, increase in low-vol
+                vol_multiplier = self._get_volatility_regime_multiplier(coin)
+                adjusted_kelly *= vol_multiplier
+                
+                # Clamp Kelly sizing between 0.5% (minimum) and Config.MAX_EXPOSURE_PCT (maximum)
+                risk_fraction = max(0.005, min(self.max_exposure_pct, adjusted_kelly))
+                db.log_system("RISK", 
+                    f"Kelly: {kelly_f:.4f} | Qtr: {quarter_kelly:.4f} | Uncertainty: {uncertainty:.3f} | "
+                    f"Confidence: {confidence:.2f} | CorrMult: {correlation_multiplier:.2f} | "
+                    f"VolMult: {vol_multiplier:.2f} | "
+                    f"Adaptive: {adjusted_kelly:.4f} | Clamped: {risk_fraction*100:.2f}%")
         else:
             # Under-sampled history fallback: Use standard 1% fixed fractional sizing
-            risk_fraction = self.risk_per_trade_pct * max(0.3, confidence) * correlation_multiplier
+            vol_multiplier = self._get_volatility_regime_multiplier(coin)
+            risk_fraction = self.risk_per_trade_pct * max(0.3, confidence) * correlation_multiplier * vol_multiplier
             risk_fraction = max(0.005, risk_fraction)
-            db.log_system("RISK", f"Under-sampled history ({total_trades} trades). Fixed fractional alloc: {risk_fraction*100:.2f}% (conf={confidence:.2f})")
+            db.log_system("RISK", f"Under-sampled history ({total_trades}/30 min trades). Fixed fractional alloc: {risk_fraction*100:.2f}% (conf={confidence:.2f}, vol={vol_multiplier:.2f})")
             
         # Hyperliquid requires a strict minimum order value of $10 notional.
         # We enforce $11 here to give it a safety buffer.
@@ -293,9 +306,10 @@ class RiskManager:
             
         return True, "Order approved by risk gatekeeper", rounded_size
 
-    async def check_margin_feasibility(self, coin: str, price: float, min_notional: float = 11.0) -> tuple[bool, str]:
+    async def check_margin_feasibility(self, coin: str, price: float, min_notional: float = 11.0, user_state: dict = None) -> tuple[bool, str]:
         """Quick margin feasibility check without full risk evaluation.
         Used by the main loop to pre-filter coins before running full evaluate_order().
+        P1: Accepts optional user_state to avoid redundant API calls.
         
         Args:
             coin: The coin symbol
@@ -304,7 +318,9 @@ class RiskManager:
         
         Returns: Tuple (is_feasible: bool, reason: str)
         """
-        user_state = await hl_client.get_user_state()
+        # P1: Use passed-in user_state to avoid redundant API calls
+        if user_state is None:
+            user_state = await hl_client.get_user_state()
         if not user_state:
             return False, "Cannot fetch user state"
         
@@ -324,6 +340,14 @@ class RiskManager:
         
         if account_value <= 0:
             account_value = max(self.daily_starting_equity, 7.42)
+            
+        # Check max exposure limit first
+        active_max_exposure = self.max_exposure_pct
+        if account_value < 50.0:
+            active_max_exposure = 0.85
+            
+        if account_value > 0 and (margin_used / account_value) >= active_max_exposure:
+            return False, f"Max exposure limit reached! Active Margin Ratio: {margin_used/account_value*100:.2f}% (Limit: {active_max_exposure*100:.1f}%)"
         
         # Determine leverage
         if account_value < 50.0:
@@ -440,8 +464,8 @@ class RiskManager:
         # Calculate current exposure for this coin
         existing_notional = 0.0
         for p in coin_positions:
-            pos_size = abs(float(p.get("szi", 0.0)))
-            pos_entry = float(p.get("entryPx", price))
+            pos_size = abs(float(p.get("size") or 0.0))
+            pos_entry = float(p.get("entry_px") or price)
             existing_notional += pos_size * pos_entry
         
         coin_exposure_pct = existing_notional / account_value if account_value > 0 else 1.0
@@ -502,6 +526,52 @@ class RiskManager:
             
         except Exception:
             return 1.0  # Safe fallback: no reduction on error
+
+    def _get_volatility_regime_multiplier(self, coin: str) -> float:
+        """
+        S7: Volatility Regime Scaling for Position Sizing.
+        
+        Adjusts position size based on current market volatility regime.
+        High volatility → smaller positions (risk parity principle).
+        Low volatility → larger positions.
+        
+        Uses the strategy engine's price buffers to compute rolling CV.
+        
+        Returns: multiplier (0.5 = half size in high vol, 1.5 = 1.5x in low vol)
+        """
+        try:
+            from backend.services.orderbook_tracker import tracker
+            import numpy as np
+            
+            # Use the strategy engine's price buffer if available
+            from backend.services.strategy_engine import strategy_engine
+            buf = list(strategy_engine.price_buffers.get(coin, []))
+            
+            if len(buf) < 20:
+                return 1.0  # Insufficient data, neutral multiplier
+            
+            recent = np.array(buf[-20:])
+            mean_px = np.mean(recent)
+            std_px = np.std(recent)
+            
+            if mean_px <= 0:
+                return 1.0
+            
+            cv = std_px / mean_px
+            
+            # High volatility (CV > 0.005): reduce to 50% size
+            if cv > 0.005:
+                return 0.5
+            # Low volatility (CV < 0.001): increase to 150% size
+            elif cv < 0.001:
+                return 1.5
+            else:
+                # Smooth interpolation: 1.5 at CV=0.001 → 0.5 at CV=0.005
+                ratio = (cv - 0.001) / 0.004
+                return 1.5 - (ratio * 1.0)  # 1.5 → 0.5
+                
+        except Exception:
+            return 1.0  # Safe fallback
 
 # Singleton instance
 risk_manager = RiskManager()

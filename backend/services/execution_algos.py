@@ -58,7 +58,12 @@ class ExecutionAlgos:
         
         # Total slippage with floor and cap
         total_slippage = spread_component + vol_component + size_impact
-        total_slippage = max(0.0005, min(0.015, total_slippage))  # Floor 0.05%, Cap 1.5%
+        
+        # HL IOC orders act as Market Orders. To prevent "Order could not immediately match" 
+        # rejections due to micro-second websocket lag, we need a wider limit price buffer.
+        # Hyperliquid's matching engine guarantees best execution (price priority), 
+        # so this is just the worst acceptable price boundary, not the price we actually pay.
+        total_slippage = max(0.01, min(0.05, total_slippage * 2.0))  # Floor 1.0%, Cap 5.0%
         
         return total_slippage
 

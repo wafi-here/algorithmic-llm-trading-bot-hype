@@ -228,36 +228,43 @@ class TestMultiTimeframeROC:
             assert signal is None, "Should return None with insufficient data"
 
     def test_roc_uptrend_returns_long(self):
-        """All positive ROC across 3 timeframes should produce LONG."""
+        """Accelerating uptrend across all timeframes should produce LONG.
+        Uses quadratic price pattern to ensure roc_fast > roc_mid/3 (acceleration filter)."""
         from backend.services.strategy_engine import StrategyEngine
         
         with patch('backend.services.strategy_engine.tracker') as mock_tracker:
             engine = StrategyEngine()
-            engine.price_buffers["TREND"] = deque(maxlen=60)
+            engine.price_buffers["TREND"] = deque(maxlen=200)
             
-            # Create a clear uptrend (prices increasing monotonically)
-            for i in range(45):
-                engine.price_buffers["TREND"].append(100.0 + i * 0.5)
+            # Quadratic (accelerating) uptrend: price = 100 + i^1.5
+            # This ensures roc_fast > roc_mid/3 (genuine acceleration)
+            for i in range(50):
+                price = 100.0 + (i ** 1.5)
+                engine.price_buffers["TREND"].append(price)
             
-            mock_tracker.get_market_state.return_value = {"mid": 122.5}
+            latest = 100.0 + (50 ** 1.5)
+            mock_tracker.get_market_state.return_value = {"mid": latest}
             signal = engine.calculate_momentum_signals("TREND")
-            assert signal == "LONG", f"Clear uptrend should produce LONG, got {signal}"
+            assert signal == "LONG", f"Accelerating uptrend should produce LONG, got {signal}"
 
     def test_roc_downtrend_returns_short(self):
-        """All negative ROC across 3 timeframes should produce SHORT."""
+        """Accelerating downtrend across all timeframes should produce SHORT.
+        Uses quadratic price pattern for genuine acceleration."""
         from backend.services.strategy_engine import StrategyEngine
         
         with patch('backend.services.strategy_engine.tracker') as mock_tracker:
             engine = StrategyEngine()
-            engine.price_buffers["DOWN"] = deque(maxlen=60)
+            engine.price_buffers["DOWN"] = deque(maxlen=200)
             
-            # Create a clear downtrend
-            for i in range(45):
-                engine.price_buffers["DOWN"].append(200.0 - i * 0.5)
+            # Quadratic (accelerating) downtrend: price = 500 - i^1.5
+            for i in range(50):
+                price = 500.0 - (i ** 1.5)
+                engine.price_buffers["DOWN"].append(price)
             
-            mock_tracker.get_market_state.return_value = {"mid": 177.5}
+            latest = 500.0 - (50 ** 1.5)
+            mock_tracker.get_market_state.return_value = {"mid": latest}
             signal = engine.calculate_momentum_signals("DOWN")
-            assert signal == "SHORT", f"Clear downtrend should produce SHORT, got {signal}"
+            assert signal == "SHORT", f"Accelerating downtrend should produce SHORT, got {signal}"
 
     def test_roc_mixed_signals_returns_none(self):
         """Conflicting ROC across timeframes should produce None (no consensus)."""

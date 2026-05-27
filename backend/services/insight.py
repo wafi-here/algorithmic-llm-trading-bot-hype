@@ -35,6 +35,8 @@ class Insight:
     period_seconds: int          # How long this insight is valid
     source: str                  # Which strategy generated it
     created_at: float = field(default_factory=time.time)
+    # S6: Track how many consecutive cycles this insight has been active
+    consecutive_cycles: int = 0
     
     @property
     def is_expired(self) -> bool:
@@ -65,7 +67,8 @@ class Insight:
             "period_seconds": self.period_seconds,
             "source": self.source,
             "remaining_seconds": round(self.remaining_seconds),
-            "is_expired": self.is_expired
+            "is_expired": self.is_expired,
+            "consecutive_cycles": self.consecutive_cycles
         }
 
 
@@ -109,18 +112,34 @@ class InsightManager:
     def emit(self, insight: Insight) -> None:
         """
         Emits a new insight. If the same source already has an active
-        insight for this coin, it replaces it (latest signal wins).
+        insight for this coin with the same direction, increment its
+        confirmation counter. If direction changed, replace it.
+        S6: Tracks consecutive_cycles for signal persistence filtering.
         """
         if insight.coin not in self._insights:
             self._insights[insight.coin] = []
         
-        # Remove any existing insight from the same source for this coin
-        self._insights[insight.coin] = [
-            i for i in self._insights[insight.coin]
-            if i.source != insight.source
-        ]
+        # Check if we have an existing insight from the same source
+        existing = None
+        for i in self._insights[insight.coin]:
+            if i.source == insight.source:
+                existing = i
+                break
         
-        self._insights[insight.coin].append(insight)
+        if existing and existing.direction == insight.direction:
+            # S6: Same source, same direction — increment confirmation counter
+            existing.consecutive_cycles += 1
+            existing.confidence = insight.confidence  # Update confidence
+            existing.magnitude = insight.magnitude
+            existing.created_at = time.time()  # Refresh expiry
+        else:
+            # New direction or new source — replace
+            self._insights[insight.coin] = [
+                i for i in self._insights[insight.coin]
+                if i.source != insight.source
+            ]
+            insight.consecutive_cycles = 1  # First cycle
+            self._insights[insight.coin].append(insight)
     
     def expire_stale(self) -> int:
         """
@@ -142,10 +161,17 @@ class InsightManager:
         return expired_count
     
     def get_active_insights(self, coin: str) -> list[Insight]:
-        """Returns all non-expired insights for a given coin."""
+        """Returns all non-expired insights for a given coin.
+        S6: Only returns insights that have persisted >= 2 consecutive cycles,
+        filtering out noise-level single-cycle spikes.
+        FLAT signals bypass confirmation to allow immediate exits.
+        """
         if coin not in self._insights:
             return []
-        return [i for i in self._insights[coin] if not i.is_expired]
+        return [
+            i for i in self._insights[coin] 
+            if not i.is_expired and (i.consecutive_cycles >= 2 or i.direction == "FLAT")
+        ]
     
     def get_consensus(self, coin: str) -> InsightConsensus | None:
         """

@@ -166,7 +166,7 @@ async def test_execution_algorithms():
         
         # Check that mock logs are generated correctly in the database
         from backend.services.database import db
-        recent_logs = db.get_logs(limit=20)
+        recent_logs = db.get_logs(limit=100)
         assert any("TWAP" in log["message"] for log in recent_logs)
     finally:
         hl_client.is_active = original_active

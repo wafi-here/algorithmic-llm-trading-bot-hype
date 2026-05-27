@@ -52,10 +52,10 @@ class LLMSentimentEngine:
         # compound is normalized between -1 and 1
         return float(scores.get("compound", 0.0))
 
-    async def _analyze_with_gemini(self, title: str, text: str) -> dict:
+    async def _analyze_with_gemini(self, title: str, text: str, market_context: str = "") -> dict:
         """
         Uses free-tier Gemini API to perform advanced financial sentiment scoring.
-        Returns a dict: { "score": float, "summary": str }
+        Returns a dict: { "score": float, "confidence": float, "timeframe": str, "summary": str }
         """
         if not self.gemini_key:
             return None
@@ -65,10 +65,11 @@ class LLMSentimentEngine:
         prompt = (
             f"You are an expert quantitative crypto analyst. Analyze the following news article:\n"
             f"Title: {title}\n"
-            f"Content: {text}\n\n"
-            f"Respond strictly in valid JSON format. Do not write markdown tags or extra talk. Output exactly this schema:\n"
-            f'{{"sentiment_score": <float between -1.0 and 1.0>, "summary": "<1 sentence financial summary>"}}\n'
-            f"where 1.0 is extremely bullish, -1.0 is extremely bearish, and 0.0 is neutral."
+            f"Content: {text}\n"
+            f"Market Context: {market_context}\n\n"
+            f"Respond strictly in valid JSON format. Output exactly this schema:\n"
+            f'{{"sentiment_score": <float between -1.0 and 1.0>, "confidence": <float between 0.0 and 1.0>, "timeframe_impact": "<e.g., Short-term, Medium-term>", "summary": "<1 sentence financial summary>"}}\n'
+            f"where sentiment_score 1.0 is extremely bullish, -1.0 is extremely bearish, and 0.0 is neutral. Confidence reflects your certainty in this prediction."
         )
         
         payload = {
@@ -90,17 +91,27 @@ class LLMSentimentEngine:
                 parsed = json.loads(text_resp.strip())
                 return {
                     "score": float(parsed.get("sentiment_score", 0.0)),
+                    "confidence": float(parsed.get("confidence", 0.5)),
+                    "timeframe": parsed.get("timeframe_impact", "Short-term"),
                     "summary": parsed.get("summary", "")
                 }
         except Exception as e:
             db.log_system("WARNING", f"Gemini API analysis failed, falling back to VADER: {str(e)}")
         return None
 
-    async def scrape_and_analyze(self) -> float:
+    async def scrape_and_analyze(self) -> dict:
         """Scrapes RSS feeds, analyzes recent sentiment, and stores to database."""
         db.log_system("LLM", "Starting news scraping process...")
         total_score = 0.0
+        total_confidence = 0.0
         articles_processed = 0
+        
+        # Build market context for LLM
+        from backend.services.orderbook_tracker import tracker
+        state = tracker.get_market_state("BTC")
+        mid_px = state.get("mid", 0.0)
+        imbalance = state.get("imbalance_zscore", 0.0)
+        market_context = f"Current BTC Price: ${mid_px:.2f}. Orderbook imbalance Z-score: {imbalance:.2f}." if mid_px > 0 else "Market context unavailable."
         
         client = self.get_client()
         for source in self.news_sources:
@@ -122,19 +133,22 @@ class LLMSentimentEngine:
                         continue
                         
                     # Perform Analysis (Gemini primary, VADER secondary)
-                    gemini_res = await self._analyze_with_gemini(title, desc)
+                    gemini_res = await self._analyze_with_gemini(title, desc, market_context)
                     if gemini_res:
                         sentiment_score = gemini_res["score"]
-                        summary = gemini_res["summary"]
+                        confidence = gemini_res["confidence"]
+                        summary = f"[{gemini_res['timeframe']}] {gemini_res['summary']}"
                     else:
                         sentiment_score = self._analyze_local_vader(title + " " + desc)
+                        confidence = 0.5  # Default moderate confidence for local fallback
                         summary = f"Analyzed locally via VADER engine: {title}"
                         
                     # Save to database
                     db.record_sentiment(title, source, link, desc, sentiment_score, summary)
-                    db.log_system("LLM", f"Scraped: {title[:50]}... | Sentiment: {sentiment_score}")
+                    db.log_system("LLM", f"Scraped: {title[:50]}... | Sentiment: {sentiment_score:.2f} | Confidence: {confidence:.2f}")
                     
                     total_score += sentiment_score
+                    total_confidence += confidence
                     articles_processed += 1
                     
             except Exception as e:
@@ -142,11 +156,12 @@ class LLMSentimentEngine:
                     
         if articles_processed > 0:
             avg_sentiment = total_score / articles_processed
-            db.log_system("LLM", f"News scraping completed. Average sentiment score: {avg_sentiment:.2f}")
-            return avg_sentiment
+            avg_confidence = total_confidence / articles_processed
+            db.log_system("LLM", f"News scraping completed. Avg sentiment: {avg_sentiment:.2f} | Avg confidence: {avg_confidence:.2f}")
+            return {"score": avg_sentiment, "confidence": avg_confidence}
         else:
             db.log_system("LLM", "No new articles found. Returning neutral sentiment.")
-            return 0.0
+            return {"score": 0.0, "confidence": 0.5}
 
 # Singleton instance
 sentiment_engine = LLMSentimentEngine()

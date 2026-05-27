@@ -55,6 +55,8 @@ class TrailingStopManager:
     
     def __init__(self):
         self.positions: dict[str, TrackedPosition] = {}
+        from collections import deque
+        self.price_history: dict[str, deque] = {}
         
     def register_position(
         self,
@@ -119,6 +121,31 @@ class TrailingStopManager:
             price = current_prices.get(coin, 0.0)
             if price <= 0.0:
                 continue
+                
+            from collections import deque
+            if coin not in self.price_history:
+                self.price_history[coin] = deque(maxlen=60)
+            self.price_history[coin].append(price)
+            
+            # OPTIMIZATION: Volatility-Adjusted Exits
+            # Calculate dynamic volatility based on recent price history
+            if len(self.price_history[coin]) >= 20:
+                import numpy as np
+                hist_array = np.array(self.price_history[coin])
+                mean_px = np.mean(hist_array)
+                std_px = np.std(hist_array)
+                if mean_px > 0:
+                    volatility_pct = std_px / mean_px
+                    # Pure Dynamic ATR: 3x Standard Deviation, bounded between 0.5% and 15%
+                    dynamic_stop_pct = max(0.005, min(0.15, volatility_pct * 3.0))
+                    # F4: Floor enforcement — never shrink below 50% of the configured default.
+                    # This prevents premature exits in low-volatility periods.
+                    config_floor = Config.TRAILING_STOP_PCT * 0.5
+                    pos.trailing_stop_pct = max(dynamic_stop_pct, config_floor)
+                    
+                    # Note: Take Profit is intentionally NOT scaled here because 
+                    # the Hybrid Exit System relies on Alpha Decay (Signal-Based Exits)
+                    # rather than fixed numerical targets.
             
             # Calculate current unrealized PnL percentage
             if pos.side == "LONG":
@@ -134,14 +161,21 @@ class TrailingStopManager:
             if pos.side == "LONG":
                 if price > pos.peak_price:
                     pos.peak_price = price
-                    # Trail the stop upward: stop = peak × (1 - trailing_pct)
-                    new_stop = pos.peak_price * (1.0 - pos.trailing_stop_pct)
-                    pos.current_stop_price = max(pos.current_stop_price, new_stop)
+                    
+                # Trail the stop upward using the DYNAMIC trailing_stop_pct
+                new_stop = pos.peak_price * (1.0 - pos.trailing_stop_pct)
+                # Ratchet mechanism: stop can only move up, never down (unless breakeven activated)
+                pos.current_stop_price = max(pos.current_stop_price, new_stop)
             else:  # SHORT
                 if pos.peak_price == 0.0 or price < pos.peak_price:
                     pos.peak_price = price
-                    # Trail the stop downward: stop = trough × (1 + trailing_pct)
-                    new_stop = pos.peak_price * (1.0 + pos.trailing_stop_pct)
+                    
+                # Trail the stop downward using the DYNAMIC trailing_stop_pct
+                new_stop = pos.peak_price * (1.0 + pos.trailing_stop_pct)
+                # Ratchet mechanism: stop can only move down, never up
+                if pos.current_stop_price == 0.0:
+                    pos.current_stop_price = new_stop
+                else:
                     pos.current_stop_price = min(pos.current_stop_price, new_stop)
             
             # Breakeven activation: after reaching activation threshold,

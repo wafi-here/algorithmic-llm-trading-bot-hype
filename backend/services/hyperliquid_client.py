@@ -70,6 +70,9 @@ class HyperliquidClient:
         self._open_orders_cache = None
         self._open_orders_cache_time = 0.0
         
+        # F5: Track which coins have had leverage set to avoid redundant API calls
+        self._leverage_set: dict[str, int] = {}
+        
         # Throttling & Rate Limit States
         self.is_throttled = False
         self.throttle_release_time = 0.0
@@ -130,6 +133,41 @@ class HyperliquidClient:
                 return None
             self.rate_budget.record_request(weight=2)
             user_state = await asyncio.to_thread(self.info.user_state, target_user)
+            
+            # Fetch spot user state to get true Unified Account balance (USDC)
+            # We do this every 5 seconds to limit rate usage, reusing cache in between
+            now_spot = time.time()
+            if not hasattr(self, '_spot_state_cache'):
+                self._spot_state_cache = None
+                self._spot_state_time = 0
+                
+            if now_spot - self._spot_state_time > 5.0 and self.rate_budget.can_send(weight=2):
+                self.rate_budget.record_request(weight=2)
+                try:
+                    spot_state = await asyncio.to_thread(self.info.spot_user_state, target_user)
+                    self._spot_state_cache = spot_state
+                    self._spot_state_time = now_spot
+                except Exception:
+                    pass
+            
+            # Inject unified spot balance into user_state if it's higher
+            if self._spot_state_cache and "balances" in self._spot_state_cache:
+                usdc_balance = 0.0
+                for bal in self._spot_state_cache["balances"]:
+                    if bal.get("coin") == "USDC":
+                        usdc_balance = float(bal.get("total", 0.0))
+                        break
+                
+                # Check cross and isolated, update accountValue if usdc_balance is larger
+                cross_val = float(user_state.get("crossMarginSummary", {}).get("accountValue", 0.0))
+                iso_val = float(user_state.get("marginSummary", {}).get("accountValue", 0.0))
+                
+                if usdc_balance > max(cross_val, iso_val):
+                    if "crossMarginSummary" in user_state:
+                        user_state["crossMarginSummary"]["accountValue"] = str(usdc_balance)
+                    if "marginSummary" in user_state:
+                        user_state["marginSummary"]["accountValue"] = str(usdc_balance)
+            
             self._user_state_cache = user_state
             self._user_state_cache_time = now
             return user_state
@@ -152,15 +190,16 @@ class HyperliquidClient:
         asset_positions = state.get("assetPositions", [])
         for pos in asset_positions:
             p = pos.get("position", {})
-            if float(p.get("szi", 0)) != 0:
+            szi_val = p.get("szi") or 0
+            if float(szi_val) != 0:
                 positions.append({
                     "coin": p.get("coin"),
-                    "side": "LONG" if float(p.get("szi", 0)) > 0 else "SHORT",
-                    "size": abs(float(p.get("szi", 0))),
-                    "entry_px": float(p.get("entryPx", 0)),
-                    "liquidation_px": float(p.get("liquidationPx", 0)),
-                    "unrealized_pnl": float(p.get("unrealizedPnl", 0)),
-                    "leverage": p.get("leverage", {}).get("value", 1)
+                    "side": "LONG" if float(szi_val) > 0 else "SHORT",
+                    "size": abs(float(szi_val)),
+                    "entry_px": float(p.get("entryPx") or 0),
+                    "liquidation_px": float(p.get("liquidationPx") or 0),
+                    "unrealized_pnl": float(p.get("unrealizedPnl") or 0),
+                    "leverage": (p.get("leverage") or {}).get("value", 1)
                 })
         return positions
 
@@ -252,10 +291,13 @@ class HyperliquidClient:
         # Run background task
         asyncio.create_task(recovery_task())
 
-    async def place_order(self, coin: str, is_buy: bool, size: float, price: float, reduce_only: bool = False):
+    async def place_order(self, coin: str, is_buy: bool, size: float, price: float, reduce_only: bool = False, order_type: str = "Ioc"):
         """
         Place an order to Hyperliquid L1.
         If AGENT_PRIVATE_KEY is missing, executes a local mock simulation trade.
+        
+        P2: order_type defaults to 'Ioc' (Immediate-or-Cancel) for signal-driven entries.
+        Use 'Gtc' (Good-Til-Cancelled) only for grid/MM resting limit orders.
         """
         # 1. Throttling Pre-Check
         if getattr(self, 'is_throttled', False) and time.time() < getattr(self, 'throttle_release_time', 0.0):
@@ -264,8 +306,10 @@ class HyperliquidClient:
             self.is_throttled = False
 
         if not self.is_active:
-            db.log_system("SIMULATION", f"PLACING MOCK ORDER: {coin} | Side: {'BUY/LONG' if is_buy else 'SELL/SHORT'} | Size: {size} | Px: {price}")
-            db.record_trade(coin, "BUY" if is_buy else "SELL", size, price, pnl=0.0, cloid="MOCK_TX")
+            # F3: Entry trades recorded with pnl=None to distinguish from breakeven exits
+            trade_pnl = 0.0 if reduce_only else None
+            db.log_system("SIMULATION", f"PLACING MOCK ORDER: {coin} | Side: {'BUY/LONG' if is_buy else 'SELL/SHORT'} | Size: {size} | Px: {price} | TIF: {order_type}")
+            db.record_trade(coin, "BUY" if is_buy else "SELL", size, price, pnl=trade_pnl, cloid="MOCK_TX")
             return {"status": "ok", "response": {"type": "mock", "id": "MOCK_ORDER_ID"}}
         
         # Rate budget pre-check for live orders
@@ -278,7 +322,7 @@ class HyperliquidClient:
             db.log_system("RATE_LIMIT", f"Approaching rate limit. Remaining budget: {remaining} weight. Proceeding cautiously.")
             
         try:
-            # Always ensure dynamic leverage is optimal for small accounts before placing first order
+            # F5: Only set leverage when it hasn't been set for this coin or when tier changes
             try:
                 user_state = await self.get_user_state()
                 account_val = 0.0
@@ -293,9 +337,13 @@ class HyperliquidClient:
                     leverage_to_set = 20
                 else:
                     leverage_to_set = 5
-                    
-                self.rate_budget.record_request(weight=2)
-                await asyncio.to_thread(self.exchange.update_leverage, leverage_to_set, coin)
+                
+                # F5: Only call update_leverage if not already set to this value for this coin
+                if self._leverage_set.get(coin) != leverage_to_set:
+                    self.rate_budget.record_request(weight=2)
+                    await asyncio.to_thread(self.exchange.update_leverage, leverage_to_set, coin)
+                    self._leverage_set[coin] = leverage_to_set
+                    db.log_system("INFO", f"Leverage set to {leverage_to_set}x for {coin}")
             except Exception as le:
                 db.log_system("WARNING", f"Could not adjust leverage dynamically for {coin}: {str(le)}")
 
@@ -307,19 +355,19 @@ class HyperliquidClient:
             decimals, min_size = risk_manager.get_asset_sz_decimals(coin)
             rounded_size = round(size, decimals)
             
-            db.log_system("EXECUTION", f"Sending L1 Tx: {coin} | Buy: {is_buy} | Size: {rounded_size} | Px: {rounded_price} | ReduceOnly: {reduce_only}")
+            db.log_system("EXECUTION", f"Sending L1 Tx: {coin} | Buy: {is_buy} | Size: {rounded_size} | Px: {rounded_price} | ReduceOnly: {reduce_only} | TIF: {order_type}")
             
             # Record the API weight for the order
             self.rate_budget.record_request(weight=5)
             
-            # Place order via Hyperliquid Exchange API
+            # P2: Use order_type parameter (IOC for signal-driven, GTC for resting MM/grid)
             order_result = await asyncio.to_thread(
                 self.exchange.order,
                 coin,
                 is_buy,
                 rounded_size,
                 rounded_price,
-                {"limit": {"tif": "Gtc"}},
+                {"limit": {"tif": order_type}},
                 reduce_only=reduce_only
             )
             
@@ -332,8 +380,9 @@ class HyperliquidClient:
                     self._handle_cumulative_limit_error(coin)
             
             if order_result.get("status") == "ok":
-                # Log to local trade history
-                db.record_trade(coin, "BUY" if is_buy else "SELL", rounded_size, rounded_price, pnl=0.0, cloid="L1_TX")
+                # F3: Entry trades recorded with pnl=None; only exits have pnl values
+                trade_pnl = 0.0 if reduce_only else None
+                db.record_trade(coin, "BUY" if is_buy else "SELL", rounded_size, rounded_price, pnl=trade_pnl, cloid="L1_TX")
                 
             return order_result
             
