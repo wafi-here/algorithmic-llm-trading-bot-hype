@@ -3,6 +3,8 @@ import json
 import traceback
 import websockets
 import threading
+import numpy as np
+from collections import deque
 from backend.config import Config
 from backend.services.database import db
 
@@ -15,6 +17,12 @@ class OrderBookTracker:
         self.books = {
             coin: {"bids": {}, "asks": {}, "mid": 0.0, "spread": 0.0, "imbalance": 0.0}
             for coin in coins
+        }
+        
+        # Rolling imbalance history for Z-Score normalization (microstructure signal)
+        # Stores last 50 raw imbalance values per coin to compute a normalized Z-Score
+        self.imbalance_history = {
+            coin: deque(maxlen=50) for coin in coins
         }
         
         self._running = False
@@ -45,6 +53,7 @@ class OrderBookTracker:
                 if coin not in self.coins:
                     self.coins.append(coin)
                     self.books[coin] = {"bids": {}, "asks": {}, "mid": 0.0, "spread": 0.0, "imbalance": 0.0}
+                    self.imbalance_history[coin] = deque(maxlen=50)
                     if hasattr(self, '_active_ws') and self._active_ws and self._loop:
                         # Schedule subscription in async loop
                         msg = json.dumps({"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}})
@@ -142,6 +151,20 @@ class OrderBookTracker:
         imbalance = 0.0
         if (bid_volume + ask_volume) > 0:
             imbalance = (bid_volume - ask_volume) / (bid_volume + ask_volume)
+        
+        # Compute Z-Score normalized imbalance for microstructure signal
+        # This transforms the noisy raw OBI into a statistically meaningful deviation metric
+        imbalance_zscore = 0.0
+        if coin not in self.imbalance_history:
+            self.imbalance_history[coin] = deque(maxlen=50)
+        self.imbalance_history[coin].append(imbalance)
+        
+        if len(self.imbalance_history[coin]) >= 10:
+            imb_array = np.array(self.imbalance_history[coin])
+            imb_mean = np.mean(imb_array)
+            imb_std = np.std(imb_array)
+            if imb_std > 0.0001:
+                imbalance_zscore = (imbalance - imb_mean) / imb_std
             
         # Update memory state under thread lock
         with self._lock:
@@ -151,6 +174,7 @@ class OrderBookTracker:
                 "mid": mid,
                 "spread": spread,
                 "imbalance": imbalance,
+                "imbalance_zscore": imbalance_zscore,
                 "best_bid": best_bid,
                 "best_ask": best_ask
             }
@@ -168,6 +192,7 @@ class OrderBookTracker:
                 "mid": mid,
                 "spread": mid * 0.0001,
                 "imbalance": 0.0,
+                "imbalance_zscore": 0.0,
                 "best_bid": mid - (mid * 0.00005),
                 "best_ask": mid + (mid * 0.00005),
                 "is_mock": True

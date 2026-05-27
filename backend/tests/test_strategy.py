@@ -130,14 +130,20 @@ async def test_funding_rate_arbitrage_agent():
     assert "annualized_apy" in opportunities[0]
 
 def test_momentum_signals_with_rolling_buffer():
-    """Verify momentum SMA crossover signals with real rolling price history."""
+    """Verify multi-timeframe ROC momentum signals with real rolling price history."""
+    from unittest.mock import patch
     engine = StrategyEngine(asset_a="BTC", asset_b="ETH", window_size=10)
-    # Simulate 25 ticks of rising prices to get SMA fast > SMA slow
-    for i in range(25):
-        engine.price_buffers.setdefault("BTC", deque(maxlen=50))
+    # Simulate 45 ticks of rising prices (ROC needs 40-tick lookback)
+    for i in range(45):
+        engine.price_buffers.setdefault("BTC", deque(maxlen=60))
         engine.price_buffers["BTC"].append(67000.0 + i * 10.0)
-    signal = engine.calculate_momentum_signals("BTC")
-    assert signal == "LONG"  # Fast SMA > Slow SMA in uptrend
+    # Mock tracker to return a price that continues the uptrend (67450)
+    # Without this, the default mock mid (67250) is lower than recent prices,
+    # which breaks the fast ROC consensus.
+    with patch('backend.services.strategy_engine.tracker') as mock_tracker:
+        mock_tracker.get_market_state.return_value = {"mid": 67450.0}
+        signal = engine.calculate_momentum_signals("BTC")
+    assert signal == "LONG"  # All 3 ROC timeframes positive in uptrend
 
 def test_volatility_breakout_with_rolling_buffer():
     """Verify Bollinger Band breakout detection with real price data."""

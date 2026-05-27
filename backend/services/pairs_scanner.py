@@ -63,7 +63,7 @@ class CointegratedPairsScanner:
                 time.sleep(10)
 
     def _calculate_cointegration(self):
-        """Computes correlation matrices and Engle-Granger stability residuals."""
+        """Computes correlation matrices, Engle-Granger stability residuals, and ADF stationarity test."""
         pairs_scanned = {}
         
         # Scan all unique pair combinations
@@ -92,10 +92,22 @@ class CointegratedPairsScanner:
                 residuals = prices_a - (slope * prices_b + intercept)
                 stability_index = np.std(residuals)
                 
+                # 4. Augmented Dickey-Fuller (ADF) Test on residuals
+                # Tests whether the spread is stationary (mean-reverting)
+                # This is the mathematically correct test for cointegration
+                adf_stat, adf_pvalue = self._adf_test(residuals)
+                
                 pair_key = f"{asset_a}_{asset_b}"
                 
-                # A pair is classified as cointegrated if it has high correlation and low spread residual variance
-                is_cointegrated = abs(correlation) > 0.70 and stability_index < (np.mean(prices_a) * 0.05)
+                # A pair is classified as cointegrated if:
+                # (a) High absolute correlation (> 0.70)
+                # (b) ADF test rejects unit root (p-value < 0.05) — residuals are stationary
+                # (c) Low spread residual variance relative to price
+                is_cointegrated = (
+                    abs(correlation) > 0.70 
+                    and adf_pvalue < 0.05 
+                    and stability_index < (np.mean(prices_a) * 0.05)
+                )
                 
                 pairs_scanned[pair_key] = {
                     "asset_a": asset_a,
@@ -103,12 +115,75 @@ class CointegratedPairsScanner:
                     "correlation": float(correlation),
                     "hedge_ratio": float(slope),
                     "stability_index": float(stability_index),
+                    "adf_statistic": float(adf_stat),
+                    "adf_pvalue": float(adf_pvalue),
                     "status": "COINTEGRATED" if is_cointegrated else "UNCORRELATED",
                     "price_a": prices_a[-1],
                     "price_b": prices_b[-1]
                 }
                 
         self.pair_stats = pairs_scanned
+
+    def _adf_test(self, series: np.ndarray) -> tuple:
+        """
+        Augmented Dickey-Fuller test implemented with pure numpy.
+        Tests the null hypothesis that the time series has a unit root (non-stationary).
+        
+        Methodology (Engle-Granger, 1987):
+        1. Compute first differences: Δy_t = y_t - y_{t-1}
+        2. Regress Δy_t on y_{t-1} (with intercept)
+        3. Compute t-statistic for the coefficient on y_{t-1}
+        4. Compare against MacKinnon critical values
+        
+        Returns: (adf_statistic, approximate_p_value)
+        """
+        if len(series) < 10:
+            return (0.0, 1.0)  # Insufficient data
+        
+        # First differences
+        dy = np.diff(series)
+        y_lagged = series[:-1]
+        
+        n = len(dy)
+        
+        # Regression: Δy_t = alpha + beta * y_{t-1} + epsilon
+        # Using OLS: [alpha, beta] = (X'X)^{-1} X'y
+        X = np.column_stack([np.ones(n), y_lagged])
+        
+        try:
+            # OLS coefficients
+            XtX_inv = np.linalg.inv(X.T @ X)
+            beta_hat = XtX_inv @ (X.T @ dy)
+            
+            # Residuals and standard errors
+            residuals = dy - X @ beta_hat
+            sigma_sq = np.sum(residuals ** 2) / (n - 2)
+            se = np.sqrt(np.diag(sigma_sq * XtX_inv))
+            
+            # t-statistic for beta (coefficient on y_{t-1})
+            if se[1] > 0:
+                adf_stat = beta_hat[1] / se[1]
+            else:
+                adf_stat = 0.0
+            
+            # Approximate p-value using MacKinnon critical values for n=100
+            # Critical values (with constant, no trend):
+            #   1%: -3.51, 5%: -2.89, 10%: -2.58
+            if adf_stat < -3.51:
+                p_value = 0.005  # Very significant
+            elif adf_stat < -2.89:
+                p_value = 0.03   # Significant at 5%
+            elif adf_stat < -2.58:
+                p_value = 0.08   # Marginally significant
+            elif adf_stat < -1.95:
+                p_value = 0.30   # Not significant
+            else:
+                p_value = 0.80   # Clearly non-stationary
+            
+            return (float(adf_stat), float(p_value))
+            
+        except np.linalg.LinAlgError:
+            return (0.0, 1.0)  # Singular matrix fallback
 
     def get_rankings(self):
         """Returns cointegration rankings. Fallbacks to baseline stats if history under-sampled."""
@@ -127,6 +202,8 @@ class CointegratedPairsScanner:
                 "correlation": stats["correlation"],
                 "hedge_ratio": stats["hedge_ratio"],
                 "stability_index": stats["stability_index"],
+                "adf_statistic": stats.get("adf_statistic", 0.0),
+                "adf_pvalue": stats.get("adf_pvalue", 1.0),
                 "status": stats["status"],
                 "price_a": stats["price_a"],
                 "price_b": stats["price_b"]

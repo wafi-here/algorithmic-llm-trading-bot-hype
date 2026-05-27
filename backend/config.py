@@ -33,4 +33,11 @@ class Config:
     CIRCUIT_BREAKER_LATENCY_MS = int(os.getenv("CIRCUIT_BREAKER_LATENCY_MS", 100)) # Sinyal stale after 100ms
     DAILY_DRAWDOWN_LIMIT_PCT = float(os.getenv("DAILY_DRAWDOWN_LIMIT_PCT", 0.05)) # Stop trading if -5% daily
     BOT_CYCLE_INTERVAL_SECONDS = int(os.getenv("BOT_CYCLE_INTERVAL_SECONDS", 30))
+    
+    # Position Exit Intelligence (Lean TrailingStopRiskManagementModel inspired)
+    TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", 0.05))             # 5% trailing stop from peak PnL
+    TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", 0.10))                 # 10% take-profit target
+    BREAKEVEN_ACTIVATION_PCT = float(os.getenv("BREAKEVEN_ACTIVATION_PCT", 0.02)) # Move stop to entry after 2% profit
+    MAX_HOLD_SECONDS = int(os.getenv("MAX_HOLD_SECONDS", 21600))                # 6 hours max hold time
+    MAX_EXPOSURE_PER_COIN_PCT = float(os.getenv("MAX_EXPOSURE_PER_COIN_PCT", 0.30)) # No single coin > 30% of portfolio
 

@@ -192,8 +192,10 @@ class StrategyEngine:
 
     def calculate_momentum_signals(self, coin: str) -> str:
         """
-        Time-Series Momentum Strategy (Trend Following).
-        Calculates simple moving average crossovers (Fast 5 vs Slow 20 ticks).
+        Multi-Timeframe Rate-of-Change (ROC) Momentum Strategy.
+        Replaces single SMA crossover with consensus across 3 timeframes
+        to eliminate whipsaw false signals. ROC directly measures return
+        velocity, which is the actual quantity of interest.
         """
         state = tracker.get_market_state(coin)
         price = state.get("mid", 0.0)
@@ -202,25 +204,28 @@ class StrategyEngine:
 
         # Append current price to the per-coin rolling buffer
         if coin not in self.price_buffers:
-            self.price_buffers[coin] = deque(maxlen=50)
+            self.price_buffers[coin] = deque(maxlen=60)
         self.price_buffers[coin].append(price)
 
         buf = list(self.price_buffers[coin])
-        if len(buf) < 20:
-            # Not enough data for Slow SMA(20); cannot generate signal
+        if len(buf) < 40:
+            # Not enough data for the slowest ROC(40) lookback
             return None
 
-        # Compute real Fast SMA (5) and Slow SMA (20) from rolling buffer
-        sma_fast = float(np.mean(buf[-5:]))
-        sma_slow = float(np.mean(buf[-20:]))
+        # Rate-of-Change: (price_now - price_n_ago) / price_n_ago
+        # Measures the velocity of price movement at each timeframe
+        roc_fast = (buf[-1] - buf[-5]) / buf[-5] if buf[-5] != 0 else 0.0    # 5-tick ROC
+        roc_mid = (buf[-1] - buf[-15]) / buf[-15] if buf[-15] != 0 else 0.0  # 15-tick ROC
+        roc_slow = (buf[-1] - buf[-40]) / buf[-40] if buf[-40] != 0 else 0.0 # 40-tick ROC
 
-        if sma_fast > sma_slow:
-            db.log_system("STRATEGY_MOMENTUM", f"Fast SMA > Slow SMA on {coin}. Signal: LONG")
+        # Multi-timeframe consensus: all three must agree on direction
+        if roc_fast > 0 and roc_mid > 0 and roc_slow > 0:
+            db.log_system("STRATEGY_MOMENTUM", f"ROC consensus LONG on {coin} | Fast:{roc_fast:.4f} Mid:{roc_mid:.4f} Slow:{roc_slow:.4f}")
             return "LONG"
-        elif sma_fast < sma_slow:
-            db.log_system("STRATEGY_MOMENTUM", f"Fast SMA < Slow SMA on {coin}. Signal: SHORT")
+        elif roc_fast < 0 and roc_mid < 0 and roc_slow < 0:
+            db.log_system("STRATEGY_MOMENTUM", f"ROC consensus SHORT on {coin} | Fast:{roc_fast:.4f} Mid:{roc_mid:.4f} Slow:{roc_slow:.4f}")
             return "SHORT"
-        return "FLAT"
+        return None  # No consensus = no signal (safer than returning FLAT)
 
     def calculate_volatility_breakout(self, coin: str) -> str:
         """
@@ -234,7 +239,7 @@ class StrategyEngine:
 
         # Append current price to the per-coin rolling buffer
         if coin not in self.price_buffers:
-            self.price_buffers[coin] = deque(maxlen=50)
+            self.price_buffers[coin] = deque(maxlen=60)
         self.price_buffers[coin].append(price)
 
         buf = list(self.price_buffers[coin])
@@ -259,6 +264,28 @@ class StrategyEngine:
             db.log_system("STRATEGY_BREAKOUT", f"Price ${price:.2f} broke Lower Band ${lower_band:.2f} on {coin}. Signal: SHORT (Breakout)")
             return "SHORT"
         return "FLAT"
+
+    def calculate_orderbook_imbalance_signal(self, coin: str) -> str:
+        """
+        Orderbook Imbalance (OBI) Microstructure Signal.
+        Uses Z-Score normalized order book imbalance to detect
+        statistically significant buy/sell pressure anomalies.
+        
+        Academic backing: Cartea et al., "Algorithmic and High-Frequency Trading" (2015).
+        OBI Z-Score > 2.0 indicates extreme buy pressure (LONG signal).
+        OBI Z-Score < -2.0 indicates extreme sell pressure (SHORT signal).
+        """
+        state = tracker.get_market_state(coin)
+        imbalance_zscore = state.get("imbalance_zscore", 0.0)
+        
+        # Only generate signal on statistically extreme imbalance deviations
+        if imbalance_zscore > 2.0:
+            db.log_system("STRATEGY_OBI", f"OBI Z-Score {imbalance_zscore:.2f} > 2.0 on {coin}. Extreme buy pressure. Signal: LONG")
+            return "LONG"
+        elif imbalance_zscore < -2.0:
+            db.log_system("STRATEGY_OBI", f"OBI Z-Score {imbalance_zscore:.2f} < -2.0 on {coin}. Extreme sell pressure. Signal: SHORT")
+            return "SHORT"
+        return None  # No extreme imbalance = no signal
 
     def calculate_grid_signals(self, coin: str) -> list[dict]:
         """

@@ -1,10 +1,73 @@
 import asyncio
+import numpy as np
+from collections import deque
 from backend.services.database import db
 from backend.services.hyperliquid_client import hl_client
 
+
 class ExecutionAlgos:
     def __init__(self):
-        pass
+        # Per-coin price history for volatility estimation
+        self._price_history: dict[str, deque] = {}
+
+    def calculate_dynamic_slippage(self, coin: str, size: float, is_buy: bool, market_state: dict = None) -> float:
+        """
+        Dynamic Slippage Model inspired by Lean's VolumeShareSlippageModel.
+        
+        Instead of a fixed 0.5% buffer, computes adaptive slippage based on:
+        1. Spread width: wider spread = more slippage (direct market cost)
+        2. Volatility: higher recent price variance = more slippage buffer
+        3. Size impact: larger orders relative to book depth = more price impact
+        
+        Formula: slippage = max(floor, base_spread + vol_component + size_impact)
+        
+        Returns: slippage as a fraction (e.g., 0.003 = 0.3%)
+        """
+        if market_state is None:
+            from backend.services.orderbook_tracker import tracker
+            market_state = tracker.get_market_state(coin)
+        
+        mid = market_state.get("mid", 0.0)
+        best_bid = market_state.get("best_bid", mid * 0.999)
+        best_ask = market_state.get("best_ask", mid * 1.001)
+        
+        if mid <= 0:
+            return 0.005  # Fallback to 0.5% if no data
+        
+        # 1. Spread component: half-spread as base cost
+        spread = (best_ask - best_bid) / mid if best_ask > best_bid else 0.001
+        spread_component = spread / 2.0  # Half-spread is the expected crossing cost
+        
+        # 2. Volatility component: rolling 20-tick price std / mid
+        if coin not in self._price_history:
+            self._price_history[coin] = deque(maxlen=30)
+        self._price_history[coin].append(mid)
+        
+        vol_component = 0.0
+        if len(self._price_history[coin]) >= 5:
+            prices = np.array(self._price_history[coin])
+            returns_std = np.std(np.diff(prices) / prices[:-1]) if len(prices) > 1 else 0.0
+            vol_component = min(0.005, returns_std * 2.0)  # Cap vol contribution at 0.5%
+        
+        # 3. Size impact: Lean-style coefficient × (size_notional / estimated_book_depth)
+        # For crypto perps, typical L2 depth near top-of-book is ~$50k-$500k
+        size_notional = size * mid
+        estimated_depth = 100000.0  # Conservative estimate for Hyperliquid L2
+        size_ratio = min(1.0, size_notional / estimated_depth)
+        size_impact = 0.001 * (size_ratio ** 0.5)  # Square root impact model
+        
+        # Total slippage with floor and cap
+        total_slippage = spread_component + vol_component + size_impact
+        total_slippage = max(0.0005, min(0.015, total_slippage))  # Floor 0.05%, Cap 1.5%
+        
+        return total_slippage
+
+    def compute_exec_price(self, price: float, is_buy: bool, slippage: float) -> float:
+        """Computes execution price with slippage applied in the correct direction."""
+        if is_buy:
+            return price * (1.0 + slippage)
+        else:
+            return price * (1.0 - slippage)
 
     async def execute_twap(self, coin: str, is_buy: bool, total_size: float, duration_seconds: int = 30, slices: int = 3):
         """
@@ -27,8 +90,9 @@ class ExecutionAlgos:
                 
             db.log_system("EXECUTION_ALGO", f"TWAP Slice {idx+1}/{slices} | Placing size: {slice_size:.4f} at price: ${price:.2f}")
             
-            # Slippage tolerance
-            exec_price = price * 1.005 if is_buy else price * 0.995
+            # Dynamic slippage (replaces hardcoded 0.5%)
+            slippage = self.calculate_dynamic_slippage(coin, slice_size, is_buy, market_state)
+            exec_price = self.compute_exec_price(price, is_buy, slippage)
             
             await hl_client.place_order(coin, is_buy, slice_size, exec_price)
             
@@ -65,7 +129,8 @@ class ExecutionAlgos:
                 
             db.log_system("EXECUTION_ALGO", f"VWAP Slice {idx+1}/{slices} (Weight: {slice_weight*100:.1f}%) | Sizing: {slice_size:.4f} at: ${price:.2f}")
             
-            exec_price = price * 1.005 if is_buy else price * 0.995
+            slippage = self.calculate_dynamic_slippage(coin, slice_size, is_buy, market_state)
+            exec_price = self.compute_exec_price(price, is_buy, slippage)
             await hl_client.place_order(coin, is_buy, slice_size, exec_price)
             
             if idx < slices - 1:
@@ -96,7 +161,8 @@ class ExecutionAlgos:
                 
             db.log_system("EXECUTION_ALGO", f"Iceberg Slice {slice_idx} | Placing size: {current_slice:.4f} at: ${price:.2f} (Remaining: {remaining_size-current_slice:.4f})")
             
-            exec_price = price * 1.005 if is_buy else price * 0.995
+            slippage = self.calculate_dynamic_slippage(coin, current_slice, is_buy, market_state)
+            exec_price = self.compute_exec_price(price, is_buy, slippage)
             await hl_client.place_order(coin, is_buy, current_slice, exec_price)
             
             remaining_size -= current_slice

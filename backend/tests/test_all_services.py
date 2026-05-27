@@ -124,6 +124,7 @@ async def test_risk_manager_fractional_sizing():
     
     with patch("backend.services.risk_manager.hl_client") as mock_hl:
         mock_hl.get_user_state = AsyncMock(return_value=mock_user_state)
+        mock_hl.get_positions = AsyncMock(return_value=[])
         mock_hl.is_active = True
         
         # Let's test evaluating long order at 67000.0

@@ -19,6 +19,8 @@ from backend.services.funding_arbitrage import funding_arb_agent
 from backend.services.pairs_scanner import scanner
 from backend.services.execution_algos import execution_algos
 from backend.services.universe_manager import universe_manager
+from backend.services.trailing_stop import trailing_stop_manager
+from backend.services.insight import insight_manager, Insight
 
 # State holder to check bot execution status
 BOT_STATUS = {
@@ -83,6 +85,55 @@ async def trading_bot_loop():
                 strategy_engine.sync_with_universe(top_coins)
                 last_universe_scan = now
 
+            # ============================================================
+            # STEP 1.5: TRAILING STOP CHECK (Lean-inspired, runs FIRST)
+            # Risk management ALWAYS takes priority over alpha signals.
+            # This checks every tracked position for stop/TP/expiry triggers.
+            # ============================================================
+            current_prices = {}
+            for coin in universe_manager.get_active_universe():
+                state = tracker.get_market_state(coin)
+                mid = state.get("mid", 0.0)
+                if mid > 0:
+                    current_prices[coin] = mid
+            
+            # Update trailing stop peak tracking
+            trailing_stop_manager.update_prices(current_prices)
+            
+            # Check for exit triggers
+            exit_signals = trailing_stop_manager.check_exits(current_prices)
+            for exit_sig in exit_signals:
+                exit_coin = exit_sig["coin"]
+                exit_price = exit_sig["current_price"]
+                exit_size = exit_sig["size"]
+                exit_reason = exit_sig["reason"]
+                
+                db.log_system("EXIT_EXECUTION",
+                    f"Auto-exit {exit_coin} | Reason: {exit_reason} | "
+                    f"PnL: {exit_sig['pnl_pct']}% | Peak: {exit_sig['peak_pnl_pct']}%"
+                )
+                
+                # Execute the exit order
+                is_buy = exit_sig["side"] == "SHORT"  # Close SHORT = buy, close LONG = sell
+                slippage = execution_algos.calculate_dynamic_slippage(exit_coin, exit_size, is_buy)
+                exec_price = execution_algos.compute_exec_price(exit_price, is_buy, slippage)
+                
+                await hl_client.place_order(
+                    coin=exit_coin,
+                    is_buy=is_buy,
+                    size=exit_size,
+                    price=exec_price,
+                    reduce_only=True
+                )
+                
+                # Record the trade and untrack
+                pnl_usd = exit_sig["pnl_pct"] / 100.0 * exit_sig["entry_price"] * exit_size
+                db.record_trade(exit_coin, "SELL" if is_buy else "BUY", exit_size, exec_price, pnl=pnl_usd, cloid=f"EXIT_{exit_reason}")
+                trailing_stop_manager.unregister_position(exit_coin)
+                insight_manager.clear_coin(exit_coin)
+
+            # STEP 1.6: Expire stale insights
+            expired_count = insight_manager.expire_stale()
 
             # 2. Run strategy signal check
             # Calculates Z-scores and generates trade signals (LONG/SHORT/FLAT)
@@ -109,6 +160,7 @@ async def trading_bot_loop():
             for coin in coins_to_evaluate:
                 mom_sig = strategy_engine.calculate_momentum_signals(coin)
                 brk_sig = strategy_engine.calculate_volatility_breakout(coin)
+                obi_sig = strategy_engine.calculate_orderbook_imbalance_signal(coin)
                 zs_sig = zscore_signals.get(coin)
                 
                 # Determine the best action and its strength for this coin
@@ -121,6 +173,10 @@ async def trading_bot_loop():
                     action = zs_sig
                     strength = 3
                     sources = ["Z-Score", "Momentum", "Breakout"]
+                    # OBI confirmation boosts to max-strength signal
+                    if obi_sig == zs_sig:
+                        strength = 4
+                        sources.append("OBI")
                 
                 # Priority 2: Z-Score signal confirmed by at least one trend indicator
                 elif zs_sig and zs_sig != "FLAT" and (mom_sig == zs_sig or brk_sig == zs_sig):
@@ -128,12 +184,25 @@ async def trading_bot_loop():
                     strength = 2
                     confirmer = "Momentum" if mom_sig == zs_sig else "Breakout"
                     sources = ["Z-Score", confirmer]
+                    # OBI confirmation boosts strength
+                    if obi_sig == zs_sig:
+                        strength = 3
+                        sources.append("OBI")
+                
+                # Priority 2.5: OBI confirms a standalone Z-Score signal (microstructure + stat arb)
+                elif zs_sig and zs_sig != "FLAT" and obi_sig == zs_sig:
+                    action = zs_sig
+                    strength = 2
+                    sources = ["Z-Score", "OBI"]
                 
                 # Priority 3: Strong Consensus from Momentum + Breakout (no Z-Score)
                 elif mom_sig and brk_sig and mom_sig == brk_sig and mom_sig != "FLAT":
                     action = mom_sig
                     strength = 2
                     sources = ["Momentum", "Breakout"]
+                    if obi_sig == mom_sig:
+                        strength = 3
+                        sources.append("OBI")
                     db.log_system("STRATEGY_CONSENSUS", f"Strong {mom_sig} consensus from Momentum + Breakout on {coin}")
                 
                 # Priority 4: Z-Score FLAT signal (for exit/take-profit)
@@ -205,14 +274,15 @@ async def trading_bot_loop():
                 )
                 
                 if approved:
-                    db.log_system("RISK", f"Order APPROVED for {coin} ({action}). Size: {size} | Signal: {'+'.join(sources)} (str={strength})")
+                    db.log_system("RISK", f"Order APPROVED for {coin} ({action}). Size: {size} | Signal: {'+'.join(sources)} (str={strength:.2f})")
                     
-                    # L1 Execution
+                    # L1 Execution with dynamic slippage (Lean VolumeShareSlippageModel)
                     is_buy = action == "LONG"
                     reduce_only = action == "FLAT"
                     
-                    # Set slippage price (0.5% buffer)
-                    exec_price = mid_px * 1.005 if is_buy else mid_px * 0.995
+                    # Dynamic slippage replaces static 0.5% buffer
+                    slippage = execution_algos.calculate_dynamic_slippage(coin, size, is_buy)
+                    exec_price = execution_algos.compute_exec_price(mid_px, is_buy, slippage)
                     
                     # Execute trade
                     await hl_client.place_order(
@@ -223,6 +293,19 @@ async def trading_bot_loop():
                         reduce_only=reduce_only
                     )
                     executed_any = True
+                    
+                    # Register with Trailing Stop Manager for exit protection
+                    if action in ("LONG", "SHORT"):
+                        trailing_stop_manager.register_position(
+                            coin=coin,
+                            side=action,
+                            entry_price=mid_px,
+                            size=size
+                        )
+                    elif action == "FLAT":
+                        # Untrack on manual FLAT exit
+                        trailing_stop_manager.unregister_position(coin)
+                        insight_manager.clear_coin(coin)
                 else:
                     # Log risk rejection details
                     if action != "FLAT":
@@ -498,6 +581,41 @@ def run_historical_backtest(request: BacktestRequest):
     )
     return results
 
+class WalkForwardRequest(BaseModel):
+    entry_threshold: float = 2.0
+    exit_threshold: float = 0.5
+    k_folds: int = 5
+    days: int = 10
+
+@app.post("/api/backtest/walk-forward")
+def run_walk_forward_validation(request: WalkForwardRequest):
+    """Walk-Forward Validation Backtest (Anti-Overfitting per López de Prado).
+    Partitions data into K chronological folds and produces a distribution of
+    Sharpe ratios to test strategy robustness across multiple market regimes."""
+    results = backtester.run_walk_forward_backtest(
+        entry_z=request.entry_threshold,
+        exit_z=request.exit_threshold,
+        k_folds=request.k_folds,
+        days=request.days
+    )
+    return results
+
+class MonteCarloRequest(BaseModel):
+    entry_threshold: float = 2.0
+    exit_threshold: float = 0.5
+    n_paths: int = 50
+
+@app.post("/api/backtest/monte-carlo")
+def run_monte_carlo_simulation(request: MonteCarloRequest):
+    """Monte Carlo Multi-Path Simulation. Generates multiple synthetic price paths
+    and tests strategy performance across diverse market scenarios."""
+    results = backtester.generate_monte_carlo_paths(
+        n_paths=request.n_paths,
+        entry_z=request.entry_threshold,
+        exit_z=request.exit_threshold
+    )
+    return results
+
 @app.post("/api/alerts/config")
 async def configure_telegram_alerts(request: TelegramConfig):
     """Configures Telegram tokens and dispatches an initialization check message."""
@@ -582,6 +700,22 @@ def get_strategy_diagnostics(coin: str = "BTC"):
         "bollinger_breakout": breakout,
         "active_grid_levels": grid,
         "market_making_skew": market_making
+    }
+
+@app.get("/api/trailing-stops")
+def get_trailing_stop_positions():
+    """Returns all positions tracked by the Trailing Stop Manager with exit levels."""
+    return {
+        "tracked_positions": trailing_stop_manager.get_tracked_positions(),
+        "total_tracked": len(trailing_stop_manager.positions)
+    }
+
+@app.get("/api/insights")
+def get_active_insights():
+    """Returns all active (non-expired) insights from the Insight Manager."""
+    return {
+        "active_insights": insight_manager.get_all_active(),
+        "total_active": len(insight_manager.get_all_active())
     }
 
 if __name__ == "__main__":

@@ -1,12 +1,58 @@
 import traceback
 import asyncio
 import time
+from collections import deque
 from eth_account import Account
 from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 from backend.config import Config
 from backend.services.database import db
+
+class RateLimitBudget:
+    """
+    Proactive API rate limit budget tracker using a rolling 60-second window.
+    Prevents cumulative limit errors by self-throttling before hitting exchange limits.
+    
+    Hyperliquid allows ~1200 weight per minute for REST.
+    Soft limit (warning) at 80% and hard limit (block) at 95%.
+    """
+    def __init__(self, max_weight_per_minute: int = 1200):
+        self.max_weight = max_weight_per_minute
+        self.soft_limit_pct = 0.80
+        self.hard_limit_pct = 0.95
+        self._request_log = deque()  # Stores (timestamp, weight) tuples
+    
+    def _prune_old_entries(self):
+        """Remove entries older than 60 seconds."""
+        cutoff = time.time() - 60.0
+        while self._request_log and self._request_log[0][0] < cutoff:
+            self._request_log.popleft()
+    
+    def get_current_usage(self) -> int:
+        """Returns total weight used in the current 60-second window."""
+        self._prune_old_entries()
+        return sum(w for _, w in self._request_log)
+    
+    def can_send(self, weight: int = 1) -> bool:
+        """Checks if the budget allows a request of the given weight."""
+        self._prune_old_entries()
+        current = self.get_current_usage()
+        hard_limit = self.max_weight * self.hard_limit_pct
+        return (current + weight) <= hard_limit
+    
+    def is_approaching_limit(self) -> bool:
+        """Returns True if usage is above the soft limit (80%)."""
+        current = self.get_current_usage()
+        return current >= (self.max_weight * self.soft_limit_pct)
+    
+    def record_request(self, weight: int = 1):
+        """Logs a request timestamp and weight."""
+        self._request_log.append((time.time(), weight))
+    
+    def get_remaining(self) -> int:
+        """Returns remaining budget in the current window."""
+        return max(0, self.max_weight - self.get_current_usage())
 
 class HyperliquidClient:
     def __init__(self):
@@ -27,6 +73,9 @@ class HyperliquidClient:
         # Throttling & Rate Limit States
         self.is_throttled = False
         self.throttle_release_time = 0.0
+        
+        # Proactive rate limit budget tracker
+        self.rate_budget = RateLimitBudget()
         
         try:
             db.log_system("INFO", f"Initializing Hyperliquid client on {self.base_url}")
@@ -73,6 +122,13 @@ class HyperliquidClient:
             
         try:
             target_user = Config.ACCOUNT_ADDRESS if Config.ACCOUNT_ADDRESS else self.wallet_address
+            # Check rate budget before making API call
+            if not self.rate_budget.can_send(weight=2):
+                db.log_system("RATE_LIMIT", "Rate budget exhausted for user_state. Using stale cache.")
+                if self._user_state_cache is not None:
+                    return self._user_state_cache
+                return None
+            self.rate_budget.record_request(weight=2)
             user_state = await asyncio.to_thread(self.info.user_state, target_user)
             self._user_state_cache = user_state
             self._user_state_cache_time = now
@@ -211,6 +267,15 @@ class HyperliquidClient:
             db.log_system("SIMULATION", f"PLACING MOCK ORDER: {coin} | Side: {'BUY/LONG' if is_buy else 'SELL/SHORT'} | Size: {size} | Px: {price}")
             db.record_trade(coin, "BUY" if is_buy else "SELL", size, price, pnl=0.0, cloid="MOCK_TX")
             return {"status": "ok", "response": {"type": "mock", "id": "MOCK_ORDER_ID"}}
+        
+        # Rate budget pre-check for live orders
+        if not self.rate_budget.can_send(weight=5):
+            db.log_system("RATE_LIMIT", f"Rate budget exhausted. Deferring order for {coin}.")
+            return {"status": "error", "message": "Rate limit budget exhausted, order deferred"}
+        
+        if self.rate_budget.is_approaching_limit():
+            remaining = self.rate_budget.get_remaining()
+            db.log_system("RATE_LIMIT", f"Approaching rate limit. Remaining budget: {remaining} weight. Proceeding cautiously.")
             
         try:
             # Always ensure dynamic leverage is optimal for small accounts before placing first order
@@ -229,6 +294,7 @@ class HyperliquidClient:
                 else:
                     leverage_to_set = 5
                     
+                self.rate_budget.record_request(weight=2)
                 await asyncio.to_thread(self.exchange.update_leverage, leverage_to_set, coin)
             except Exception as le:
                 db.log_system("WARNING", f"Could not adjust leverage dynamically for {coin}: {str(le)}")
@@ -242,6 +308,9 @@ class HyperliquidClient:
             rounded_size = round(size, decimals)
             
             db.log_system("EXECUTION", f"Sending L1 Tx: {coin} | Buy: {is_buy} | Size: {rounded_size} | Px: {rounded_price} | ReduceOnly: {reduce_only}")
+            
+            # Record the API weight for the order
+            self.rate_budget.record_request(weight=5)
             
             # Place order via Hyperliquid Exchange API
             order_result = await asyncio.to_thread(

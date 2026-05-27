@@ -71,6 +71,7 @@ async def test_margin_precheck_sufficient():
 
     with patch("backend.services.risk_manager.hl_client") as mock_hl:
         mock_hl.get_user_state = AsyncMock(return_value=mock_state)
+        mock_hl.get_positions = AsyncMock(return_value=[])
         mock_hl.is_active = True
 
         now_ms = int(time.time() * 1000)
@@ -95,6 +96,7 @@ async def test_margin_precheck_insufficient():
 
     with patch("backend.services.risk_manager.hl_client") as mock_hl:
         mock_hl.get_user_state = AsyncMock(return_value=mock_state)
+        mock_hl.get_positions = AsyncMock(return_value=[])
         mock_hl.is_active = True
 
         now_ms = int(time.time() * 1000)
@@ -118,6 +120,7 @@ async def test_margin_precheck_zero_equity():
 
     with patch("backend.services.risk_manager.hl_client") as mock_hl:
         mock_hl.get_user_state = AsyncMock(return_value=mock_state)
+        mock_hl.get_positions = AsyncMock(return_value=[])
         mock_hl.is_active = True
 
         now_ms = int(time.time() * 1000)
@@ -303,6 +306,7 @@ async def test_negative_free_margin():
 
     with patch("backend.services.risk_manager.hl_client") as mock_hl:
         mock_hl.get_user_state = AsyncMock(return_value=mock_state)
+        mock_hl.get_positions = AsyncMock(return_value=[])
         mock_hl.is_active = True
 
         now_ms = int(time.time() * 1000)
@@ -328,6 +332,7 @@ async def test_extreme_leverage_50x_margin():
 
     with patch("backend.services.risk_manager.hl_client") as mock_hl:
         mock_hl.get_user_state = AsyncMock(return_value=mock_state)
+        mock_hl.get_positions = AsyncMock(return_value=[])
         mock_hl.is_active = True
 
         now_ms = int(time.time() * 1000)
@@ -359,6 +364,7 @@ async def test_concurrent_margin_race():
 
     with patch("backend.services.risk_manager.hl_client") as mock_hl:
         mock_hl.is_active = True
+        mock_hl.get_positions = AsyncMock(return_value=[])
         
         # First order: should succeed
         mock_hl.get_user_state = AsyncMock(return_value=mock_state_before)

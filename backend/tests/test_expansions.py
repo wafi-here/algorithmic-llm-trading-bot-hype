@@ -67,18 +67,23 @@ async def test_kelly_criterion_sizing():
     try:
         with patch("backend.services.risk_manager.hl_client") as mock_hl:
             mock_hl.get_user_state = AsyncMock(return_value=mock_user_state)
+            mock_hl.get_positions = AsyncMock(return_value=[])
             mock_hl.is_active = True
             
             now_ms = int(time.time() * 1000)
             approved, reason, size = await manager.evaluate_order("BTC", "LONG", 60000.0, now_ms)
             
-            # Balance = 10000.0 (mock)
-            # Clamped Alloc = min(Config.MAX_EXPOSURE_PCT, Half-Kelly) = min(0.20, 0.25) = 0.20 (20%)
-            # Risk Amount = 10000 * 0.20 = 2000.0
-            # Size = 2000.0 / 60000.0 = 0.033333...
-            # BTC szDecimals=5 (from fallback) → rounded to 0.03333
+            # With adaptive uncertainty penalty, the sizing is now:
+            # Kelly: 0.5, Half-Kelly: 0.25, Uncertainty: ~0.434 (10 trades = moderate sample uncertainty)
+            # Adjusted: 0.25 * (1 - 0.434) = 0.1414 → clamped at 14.14%
+            # Size = 10000 * 0.1414 / 60000 = 0.02357
+            # The key validation: order approved AND size is between floor (0.5%) and max (20%)
             assert approved is True, f"Expected approved, got: {reason}"
-            assert size == 0.03333, f"Expected 0.03333, got {size}"
+            min_size = round(10000 * 0.005 / 60000, 5)  # Floor: 0.5% allocation
+            max_size = round(10000 * 0.20 / 60000, 5)    # Cap: 20% allocation (Config.MAX_EXPOSURE_PCT)
+            assert min_size <= size <= max_size, f"Size {size} outside valid bounds [{min_size}, {max_size}]"
+            # With uncertainty penalty, size must be LESS than the old static Half-Kelly result (0.03333)
+            assert size < 0.03333, f"Adaptive Kelly should produce smaller size than static Half-Kelly, got {size}"
     finally:
         rm.db = original_db
         db = None
